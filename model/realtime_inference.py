@@ -71,7 +71,7 @@ try:
 
         def _dist(self, s1, s2):
             return np.mean([
-                dtw_lib.distance_fast(s1[:, d].astype(np.double), s2[:, d].astype(np.double))
+                dtw_lib.distance(s1[:, d].astype(np.double), s2[:, d].astype(np.double))
                 for d in range(s1.shape[1])
             ])
 
