@@ -1,15 +1,27 @@
-*.iml
-.gradle
-/local.properties
-/.idea/caches
-/.idea/libraries
-/.idea/modules.xml
-/.idea/workspace.xml
-/.idea/navEditor.xml
-/.idea/assetWizardSettings.xml
+# 가상환경
+.venv/
+venv/
+env/
+
+# 데이터셋 (19GB - 너무 큼)
+Dataset_NPZ/
+
+# Python 캐시
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Jupyter 체크포인트
+.ipynb_checkpoints/
+
+# 환경변수
+.env
+
+# IDE
+.vscode/
+.idea/
+
+# OS
 .DS_Store
-/build
-/captures
-.externalNativeBuild
-.cxx
-local.properties
+Thumbs.db
