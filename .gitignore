@@ -6,6 +6,9 @@ env/
 # 데이터셋 (19GB - 너무 큼)
 Dataset_NPZ/
 
+# 전처리 캐시 (수 GB)
+model/feat_cache/
+
 # Python 캐시
 __pycache__/
 *.pyc

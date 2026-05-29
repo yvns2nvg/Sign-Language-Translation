@@ -17,12 +17,14 @@
 # 셀 2: 경로 설정
 import os
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_ROOT = os.path.join(BASE_DIR, 'Dataset_NPZ', 'Dataset_NPZ')
-MODEL_SAVE_PATH = os.path.join(BASE_DIR, 'ksl_dtw_knn_model.pkl')
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))   # model/
+PROJECT_DIR = os.path.dirname(SCRIPT_DIR)                  # Sign-Language-Translation/
+DATA_ROOT = os.path.join(PROJECT_DIR, 'Dataset_NPZ', 'Dataset_NPZ')
+MODEL_SAVE_PATH = os.path.join(SCRIPT_DIR, 'ksl_dtw_knn_model.pkl')
 
 print(f'데이터 경로: {DATA_ROOT}')
 print(f'모델 저장 경로: {MODEL_SAVE_PATH}')
+assert os.path.isdir(DATA_ROOT), f'데이터 폴더를 찾을 수 없습니다: {DATA_ROOT}'
 
 # %%
 # 셀 3: 임포트 및 함수 정의
@@ -118,14 +120,14 @@ class DTWKNNClassifier:
         return best, conf, dists[:5]
 
 # ── 데이터 로드 (NPZ 형식) ──
-def load_dataset(root, max_samples_per_class=None):
+def load_dataset(root, max_samples_per_class=None, max_classes=None):
     """
-    NPZ 파일에서 데이터 로드.
-    max_samples_per_class: 클래스당 최대 샘플 수 (None이면 전체 로드)
-    전체 90,000샘플은 DTW+KNN에 매우 느리므로 소규모 실험 시 제한 권장.
+    max_samples_per_class: 클래스당 최대 샘플 수
+    max_classes: 로드할 최대 클래스 수 (추론 속도 제어용)
     """
     X, y = [], []
     class_counts = {}
+    class_order = []
 
     npz_files = sorted([f for f in os.listdir(root) if f.endswith('.npz')])
     if not npz_files:
@@ -139,6 +141,10 @@ def load_dataset(root, max_samples_per_class=None):
 
         for i in range(X_batch.shape[0]):
             label = str(V_batch[i])
+            if label not in class_counts:
+                if max_classes is not None and len(class_counts) >= max_classes:
+                    continue
+                class_order.append(label)
             if max_samples_per_class is not None:
                 if class_counts.get(label, 0) >= max_samples_per_class:
                     continue
@@ -154,15 +160,9 @@ print('함수 정의 완료!')
 
 # %%
 # 셀 4: 데이터 로드 + 특징 추출
-# 주의: 전체 로드(max_samples_per_class=None)는 90,000샘플로 DTW+KNN이 매우 느립니다.
-# 빠른 테스트는 max_samples_per_class=5 권장.
-MAX_TRAIN_SAMPLES = 100  # 테스트용: 총 학습 데이터 수 제한
-X_raw, y_raw, label_names = load_dataset(DATA_ROOT, max_samples_per_class=5)
-if len(X_raw) > MAX_TRAIN_SAMPLES:
-    X_raw = X_raw[:MAX_TRAIN_SAMPLES]
-    y_raw = y_raw[:MAX_TRAIN_SAMPLES]
-    label_names = sorted(list(set(y_raw)))
-    print(f'테스트 모드: {MAX_TRAIN_SAMPLES}개 샘플 / {len(label_names)}개 클래스로 제한')
+# max_classes: 추론 1분 이내 기준. 늘리면 정확도↑ 속도↓
+# 템플릿 수 = max_classes × max_samples_per_class × 16(증강) ≤ ~3000 권장
+X_raw, y_raw, label_names = load_dataset(DATA_ROOT, max_samples_per_class=3, max_classes=50)
 
 print('\n특징 추출 중...')
 X_feat = [extract_features(seq) for seq in X_raw]
