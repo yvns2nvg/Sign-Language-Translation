@@ -208,15 +208,18 @@ class TemporalBlock(nn.Module):
     def __init__(self, in_ch, out_ch, ks, dilation, dropout):
         super().__init__()
         p = (ks-1)*dilation
-        self.net = nn.Sequential(
-            nn.Conv1d(in_ch,out_ch,ks,padding=p,dilation=dilation), Chomp1d(p),
-            nn.BatchNorm1d(out_ch), nn.GELU(), nn.Dropout(dropout),
-            nn.Conv1d(out_ch,out_ch,ks,padding=p,dilation=dilation), Chomp1d(p),
-            nn.BatchNorm1d(out_ch), nn.GELU(), nn.Dropout(dropout),
-        )
+        self.conv1 = nn.Conv1d(in_ch, out_ch, ks, padding=p, dilation=dilation)
+        self.chomp1 = Chomp1d(p)
+        self.bn1 = nn.BatchNorm1d(out_ch)
+        self.conv2 = nn.Conv1d(out_ch, out_ch, ks, padding=p, dilation=dilation)
+        self.chomp2 = Chomp1d(p)
+        self.bn2 = nn.BatchNorm1d(out_ch)
+        self.dropout = nn.Dropout(dropout)
         self.downsample = nn.Conv1d(in_ch, out_ch, 1) if in_ch != out_ch else None
     def forward(self, x):
-        return F.gelu(self.net(x) + (x if self.downsample is None else self.downsample(x)))
+        y = self.dropout(F.gelu(self.bn1(self.chomp1(self.conv1(x)))))
+        y = self.dropout(F.gelu(self.bn2(self.chomp2(self.conv2(y)))))
+        return F.gelu(y + (x if self.downsample is None else self.downsample(x)))
 
 class TCNClassifier(nn.Module):
     def __init__(self, input_dim, channels, num_classes, dropout, kernel_size=5):
