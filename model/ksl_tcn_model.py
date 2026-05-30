@@ -602,7 +602,7 @@ def run_epoch(model, loader, criterion, optimizer, device, scaler, is_train, gra
                 optimizer.zero_grad(set_to_none=True)
 
             use_amp = scaler is not None and device.type == "cuda"
-            with torch.cuda.amp.autocast(enabled=use_amp):
+            with torch.amp.autocast("cuda", enabled=use_amp):
                 logits = model(X_b)
                 loss = criterion(logits, y_b)
 
@@ -783,7 +783,7 @@ def main():
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = ReduceLROnPlateau(optimizer, mode="max", patience=6, factor=0.5)
-    scaler = None if args.no_amp else torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
+    scaler = None if args.no_amp else torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
 
     run_name = f"ksl_{args.model}_improved"
     model_path = os.path.join(MODEL_DIR, run_name + ".pt")
