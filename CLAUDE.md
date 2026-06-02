@@ -15,12 +15,16 @@ Sign-Language-Translation/
 │   ├── realtime_inference.py      # 실시간 추론 스크립트 (canonical)
 │   ├── ksl_tcn_model.py           # TCN 학습 스크립트
 │   ├── train_lstm.py              # LSTM 학습 스크립트
+│   ├── test_webcam.py             # 웹캠 연결 테스트
 │   ├── ksl_tcn_improved.pt        # TCN 모델 가중치 (val_top1 99.6%, 현재 best)
 │   ├── ksl_tcn_improved_meta.pkl  # TCN 메타 (label_names 3000클래스)
 │   ├── ksl_lstm_model.pt          # LSTM 모델 가중치 (val_acc 82.7%)
 │   ├── ksl_lstm_meta.pkl          # LSTM 메타
 │   └── ksl_dtw_knn_model.pkl      # DTW+KNN 모델 (폴백용)
 ├── android_app/                   # Android 클라이언트
+├── data/                          # 로컬 전처리 데이터 (.gitignore)
+│   ├── processed_keypoints/       # NPY 키포인트 파일
+│   └── dataset_info.csv           # 데이터셋 인덱스
 ├── CLAUDE.md                      # 이 파일
 └── realtime_inference.py          # 루트 실행 편의용 사본 (model/ 가 canonical)
 ```

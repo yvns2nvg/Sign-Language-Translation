@@ -3,10 +3,20 @@
 venv/
 env/
 
-# 구형/미사용 모델 파일 (ksl_tcn_improved.pt 로 대체됨)
+# 구형/미사용 모델 파일 (삭제됨)
 sign_lstm_best.pth
 sign_lstm_model.pth
 model.py
+
+# 루트 모델 가중치 사본 (model/ 에 canonical 버전 있음)
+ksl_tcn_improved.pt
+ksl_tcn_improved_meta.pkl
+ksl_lstm_model.pt
+ksl_lstm_meta.pkl
+ksl_dtw_knn_model.pkl
+
+# 데이터 (로컬 전처리 결과물)
+data/
 
 # 데이터셋 (19GB - 너무 큼)
 Dataset_NPZ/
