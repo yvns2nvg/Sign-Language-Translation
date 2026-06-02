@@ -3,6 +3,11 @@
 venv/
 env/
 
+# 구형/미사용 모델 파일 (ksl_tcn_improved.pt 로 대체됨)
+sign_lstm_best.pth
+sign_lstm_model.pth
+model.py
+
 # 데이터셋 (19GB - 너무 큼)
 Dataset_NPZ/
 
