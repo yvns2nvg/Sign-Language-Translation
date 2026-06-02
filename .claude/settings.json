@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python model/realtime_inference.py*)",
+      "Bash(python realtime_inference.py*)",
+      "Bash(python tools/healthcheck.py)",
+      "Bash(conda activate sign_lang_env*)",
+      "Bash(pip install*)",
+      "Bash(git status)",
+      "Bash(git diff*)",
+      "Bash(git log*)",
+      "Bash(git add*)",
+      "Bash(git commit*)",
+      "Bash(git push*)",
+      "Bash(git fetch*)",
+      "Bash(git pull*)",
+      "Bash(cp model/realtime_inference.py realtime_inference.py)"
+    ]
+  }
+}
