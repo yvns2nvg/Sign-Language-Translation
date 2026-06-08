@@ -300,6 +300,9 @@ def load_model(model_path, temperature=1.0, use_tta=True):
 # 화면 UI (PIL 기반 한글 렌더링)
 # ─────────────────────────────────────────────
 _FONT_PATHS = [
+    'C:/Windows/Fonts/malgun.ttf',          # Windows: 맑은 고딕
+    'C:/Windows/Fonts/malgunbd.ttf',        # Windows: 맑은 고딕 Bold
+    'C:/Windows/Fonts/gulim.ttc',           # Windows: 굴림
     '/System/Library/Fonts/AppleSDGothicNeo.ttc',
     '/System/Library/Fonts/Supplemental/AppleGothic.ttf',
     '/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc',
