@@ -1,44 +1,24 @@
 """
-KSL Sign Recognition - Improved Training Script
-================================================
+KSL Sign Recognition - Improved Training Script  v3
+=====================================================
 
-Key improvements over the original BiLSTM+Attention script:
-1. Richer features
-   - Original hand angle/distance features: 40 dims
-   - Hand wrist relative position features
-   - Left/right hand relative features
-   - Fingertip coordinates
-   - Velocity/delta features
-   - Optional body/face reference features from remaining landmarks
+v3 주요 변경 (v2 대비):
+  1. 서명자 독립 검증 (Signer-Independent Evaluation)
+     - 클래스 내 위치 기반 서명자 ID 자동 추론 (--num-signers, --angles-per-signer)
+     - NPZ에 서명자 키가 있으면 우선 사용 (--signer-key)
+     - val 서명자를 train 서명자와 완전 분리 → 실제 일반화 성능 측정 가능
 
-2. Model choices
-   - BiLSTM + improved pooling
-   - Residual TCN + attention pooling
-   - GRU + improved pooling
+  2. 데이터 증강 (--aug 플래그로 활성화)
+     - 속도 변환 [--aug-speed-min, --aug-speed-max]: 추론 TTA 범위와 동일한 분포 학습
+     - 공간 노이즈 (--aug-jitter): 웹캠 키포인트 흔들림·조명 오차 시뮬레이션
+     - 랜덤 크롭 (--aug-crop-prob, --aug-crop-min): 30~90 프레임 짧은 녹화 시뮬레이션
 
-3. Better training / evaluation
-   - Random seed
-   - Stratified global train/val split when possible
-   - Class-weighted loss option
-   - Label smoothing
-   - Mixed precision training
-   - ReduceLROnPlateau
-   - Early stopping
-   - CSV history save
-   - Classification report
-   - Confusion matrix
-   - Top-k accuracy
+실행 (권장):
+  python model/ksl_tcn_model.py --model tcn --epochs 120 --batch-size 128 ^
+      --aug --num-signers 16 --angles-per-signer 5 --val-signers 2
 
-Run:
-  python model/train_ksl_improved.py --model tcn
-  python model/train_ksl_improved.py --model bilstm
-  python model/train_ksl_improved.py --model gru
-
-Recommended first experiment:
-  python model/train_ksl_improved.py --model tcn --epochs 120 --batch-size 128
-
-If GPU memory is insufficient:
-  python model/train_ksl_improved.py --model tcn --batch-size 64
+기존 방식 (하위 호환):
+  python model/ksl_tcn_model.py --model tcn --epochs 120 --batch-size 128
 """
 
 import os
@@ -84,6 +64,93 @@ def set_seed(seed: int = 42):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.benchmark = True
+
+
+# -----------------------------------------------------------------------------
+# Signer ID inference
+# -----------------------------------------------------------------------------
+def build_signer_ids(y_str, num_signers=16, angles_per_signer=5):
+    """
+    클래스 내 위치 기반으로 서명자 ID를 추론한다.
+
+    AI Hub KSL 데이터셋 구조 가정:
+      각 클래스(단어) 내 샘플이
+      [signer0_ang0..4, signer1_ang0..4, ..., signer15_ang0..4] 순으로 저장됨.
+
+    y_str            : (N,) str  레이블 배열
+    num_signers      : 전체 서명자 수 (기본 16)
+    angles_per_signer: 서명자당 각도 수 (기본 5)
+    반환             : (N,) int32  서명자 ID (0 ~ num_signers-1)
+    """
+    signer_ids = np.zeros(len(y_str), dtype=np.int32)
+    for cls in np.unique(y_str):
+        indices = np.where(y_str == cls)[0]
+        for local_pos, global_idx in enumerate(indices):
+            signer_ids[global_idx] = (local_pos // angles_per_signer) % num_signers
+    return signer_ids
+
+
+# -----------------------------------------------------------------------------
+# Augmentation helpers
+# -----------------------------------------------------------------------------
+def _find_actual_length(feat):
+    """제로패딩된 특징 (T, D)에서 실제 유효 프레임 수 반환."""
+    norms = np.linalg.norm(feat, axis=1)
+    nz = np.where(norms > 1e-6)[0]
+    return int(nz[-1]) + 1 if len(nz) > 0 else feat.shape[0]
+
+
+def augment_features(feat, speed=1.0, jitter_std=0.0, crop_ratio=None):
+    """
+    특징 레벨 증강. 입출력 shape 불변 (T, 206).
+
+    speed      : 속도 배율 (0.8~1.2). 1.0이면 생략.
+    jitter_std : base feature(0:103)에 추가할 Gaussian 노이즈 std.
+                 웹캠 키포인트 흔들림·조명 차이를 시뮬레이션.
+    crop_ratio : None이면 생략. 0~1 범위면 실제 길이를 이 비율로 줄이고 이후 제로패딩.
+                 추론 시 30~90 프레임 짧은 녹화를 학습 중에도 경험하게 한다.
+    """
+    DIM_BASE = 103
+    T = feat.shape[0]
+    T_actual = _find_actual_length(feat)
+    if T_actual == 0:
+        return feat
+
+    result = feat.copy()
+
+    # 1. 크롭: 짧은 녹화 시뮬레이션
+    if crop_ratio is not None and crop_ratio < 1.0:
+        T_crop = max(15, int(T_actual * crop_ratio))
+        result[T_crop:] = 0.0
+        T_actual = T_crop
+
+    # 2. 속도 변환: base 리샘플 → delta 재계산
+    if abs(speed - 1.0) > 1e-4:
+        T_new = max(10, int(T_actual * speed))
+        base = result[:T_actual, :DIM_BASE]
+        idx = np.linspace(0, T_actual - 1, T_new)
+        lo = np.floor(idx).astype(int)
+        hi = np.minimum(lo + 1, T_actual - 1)
+        w = (idx - lo)[:, np.newaxis]
+        base_new = (base[lo] * (1 - w) + base[hi] * w).astype(np.float32)
+        delta_new = np.zeros_like(base_new)
+        delta_new[1:] = base_new[1:] - base_new[:-1]
+        result = np.zeros_like(feat)
+        copy_len = min(T_new, T)
+        result[:copy_len, :DIM_BASE] = base_new[:copy_len]
+        result[:copy_len, DIM_BASE:] = delta_new[:copy_len]
+        T_actual = copy_len
+
+    # 3. 공간 노이즈: base에 Gaussian 추가 → delta 재계산
+    if jitter_std > 0.0 and T_actual > 0:
+        noise = np.random.randn(T_actual, DIM_BASE).astype(np.float32) * jitter_std
+        result[:T_actual, :DIM_BASE] += noise
+        if T_actual > 1:
+            result[1:T_actual, DIM_BASE:] = (
+                result[1:T_actual, :DIM_BASE] - result[:T_actual - 1, :DIM_BASE]
+            )
+
+    return result
 
 
 # -----------------------------------------------------------------------------
@@ -304,52 +371,158 @@ def build_label_encoder():
 
 
 class KSLDataset(Dataset):
-    def __init__(self, feat_path, lbl_path, label_encoder, indices):
+    def __init__(
+        self,
+        feat_path,
+        lbl_path,
+        label_encoder,
+        indices,
+        augment=False,
+        speed_range=(0.8, 1.2),
+        jitter_std=0.0,
+        crop_prob=0.0,
+        crop_min=0.5,
+    ):
         self.X = np.load(feat_path, mmap_mode="r")
         y_str = np.load(lbl_path)
         self.y = label_encoder.transform(y_str)
         self.idx = np.asarray(indices, dtype=np.int64)
+        self.augment = augment
+        self.speed_range = speed_range
+        self.jitter_std = jitter_std
+        self.crop_prob = crop_prob
+        self.crop_min = crop_min
 
     def __len__(self):
         return len(self.idx)
 
     def __getitem__(self, i):
         ri = self.idx[i]
-        x = torch.from_numpy(self.X[ri].copy()).float()
-        y = int(self.y[ri])
-        return x, y
+        x = self.X[ri].copy()
+
+        if self.augment:
+            speed = float(np.random.uniform(*self.speed_range))
+            crop_ratio = (
+                float(np.random.uniform(self.crop_min, 1.0))
+                if self.crop_prob > 0 and np.random.random() < self.crop_prob
+                else None
+            )
+            x = augment_features(x, speed=speed, jitter_std=self.jitter_std,
+                                  crop_ratio=crop_ratio)
+
+        return torch.from_numpy(x).float(), int(self.y[ri])
 
 
-def build_loaders(label_encoder, batch_size, val_ratio, seed, num_workers, use_weighted_sampler):
+def build_loaders(
+    label_encoder,
+    batch_size,
+    val_ratio,
+    seed,
+    num_workers,
+    use_weighted_sampler,
+    augment=False,
+    speed_range=(0.8, 1.2),
+    jitter_std=0.0,
+    crop_prob=0.0,
+    crop_min=0.5,
+    num_signers=0,
+    angles_per_signer=5,
+    val_signers=0,
+    signer_key="",
+):
+    """
+    num_signers > 0 이고 val_signers > 0 이면 서명자 독립 분리를 시도한다.
+    서명자 ID 탐색 순서:
+      1. NPZ에 signer_key (또는 자동 탐색 키)가 있으면 그대로 사용
+      2. 없으면 클래스 내 위치 기반 추론 (build_signer_ids)
+      3. 둘 다 실패하면 기존 랜덤 stratified 분리로 폴백
+    """
     feat_files = sorted([f for f in os.listdir(CACHE_DIR) if f.startswith("feats_") and f.endswith(".npy")])
     train_sets, val_sets = [], []
     train_labels_all = []
+    signer_split_used = False
+
+    _SIGNER_KEY_CANDIDATES = (
+        [signer_key] if signer_key
+        else ["S", "signer_id", "signer", "speaker", "person"]
+    )
 
     for ff in feat_files:
         num = ff.split("_")[1].split(".")[0]
         fp = os.path.join(CACHE_DIR, ff)
         lp = os.path.join(CACHE_DIR, f"labels_{num}.npy")
+        sp = os.path.join(CACHE_DIR, f"signers_{num}.npy")
+
         y_str = np.load(lp)
         y = label_encoder.transform(y_str)
         n = len(y)
         indices = np.arange(n)
 
-        # Stratified split per file if possible.
-        try:
-            train_idx, val_idx = train_test_split(
-                indices,
-                test_size=val_ratio,
-                random_state=seed,
-                shuffle=True,
-                stratify=y,
-            )
-        except ValueError:
-            rng = np.random.default_rng(seed)
-            idx = rng.permutation(n)
-            cut = int(n * (1.0 - val_ratio))
-            train_idx, val_idx = idx[:cut], idx[cut:]
+        # ── 서명자 독립 분리 시도 ──────────────────────────────────
+        use_signer_split = (num_signers > 0 and val_signers > 0
+                            and val_signers < num_signers)
+        signer_ids = None
 
-        train_sets.append(KSLDataset(fp, lp, label_encoder, train_idx))
+        if use_signer_split:
+            # 1) NPZ 캐시에서 읽기 시도
+            if os.path.exists(sp):
+                signer_ids = np.load(sp)
+            else:
+                # 2) NPZ 원본에서 읽기 시도
+                npz_files = sorted([f for f in os.listdir(DATA_ROOT) if f.endswith(".npz")])
+                npz_path = os.path.join(DATA_ROOT, npz_files[int(num)])
+                try:
+                    data_tmp = np.load(npz_path, allow_pickle=True)
+                    for key in _SIGNER_KEY_CANDIDATES:
+                        if key and key in data_tmp:
+                            signer_ids = np.array(data_tmp[key], dtype=np.int32)
+                            np.save(sp, signer_ids)
+                            print(f"  [서명자] NPZ 키 '{key}' 발견 → 캐시 저장")
+                            break
+                except Exception:
+                    pass
+
+            # 3) 위치 기반 추론 (폴백)
+            if signer_ids is None:
+                signer_ids = build_signer_ids(y_str, num_signers, angles_per_signer)
+                np.save(sp, signer_ids)
+                if not signer_split_used:
+                    print(f"  [서명자] 키 없음 → 클래스 내 위치 기반 서명자 ID 추론 "
+                          f"(num_signers={num_signers}, angles_per_signer={angles_per_signer})")
+
+            # 마지막 val_signers 명을 검증 세트로 분리
+            val_set_ids = set(range(num_signers - val_signers, num_signers))
+            train_mask = np.array([sid not in val_set_ids for sid in signer_ids])
+            train_idx = indices[train_mask]
+            val_idx = indices[~train_mask]
+
+            if not signer_split_used:
+                print(f"  [서명자 분리] 전체 {num_signers}명 중 val {val_signers}명 분리 "
+                      f"(signer ID {num_signers - val_signers}~{num_signers - 1})")
+                print(f"  train={len(train_idx):,}  val={len(val_idx):,} (파일 {ff})")
+                signer_split_used = True
+
+        # ── 폴백: 기존 랜덤 stratified 분리 ──────────────────────
+        if signer_ids is None or not use_signer_split:
+            try:
+                train_idx, val_idx = train_test_split(
+                    indices, test_size=val_ratio, random_state=seed,
+                    shuffle=True, stratify=y,
+                )
+            except ValueError:
+                rng = np.random.default_rng(seed)
+                idx = rng.permutation(n)
+                cut = int(n * (1.0 - val_ratio))
+                train_idx, val_idx = idx[:cut], idx[cut:]
+
+            if not signer_split_used and not use_signer_split:
+                print("  [분리 방식] 랜덤 stratified 분리 (--num-signers 미지정)")
+
+        train_sets.append(KSLDataset(
+            fp, lp, label_encoder, train_idx,
+            augment=augment, speed_range=speed_range,
+            jitter_std=jitter_std, crop_prob=crop_prob, crop_min=crop_min,
+        ))
         val_sets.append(KSLDataset(fp, lp, label_encoder, val_idx))
         train_labels_all.extend(y[train_idx].tolist())
 
@@ -708,27 +881,62 @@ def save_final_reports(out_prefix, label_encoder, y_true, y_pred):
 
 
 def parse_args():
-    p = argparse.ArgumentParser()
+    p = argparse.ArgumentParser(
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="KSL TCN Training v3\n\n"
+                    "권장:\n"
+                    "  python model/ksl_tcn_model.py --model tcn --epochs 120 "
+                    "--batch-size 128 --aug --num-signers 16 --angles-per-signer 5 --val-signers 2",
+    )
+    # ── 모델 ──
     p.add_argument("--model", choices=["tcn", "bilstm", "gru"], default="tcn")
-    p.add_argument("--epochs", type=int, default=120)
-    p.add_argument("--batch-size", type=int, default=128)
-    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--epochs",       type=int,   default=120)
+    p.add_argument("--batch-size",   type=int,   default=128)
+    p.add_argument("--lr",           type=float, default=1e-3)
     p.add_argument("--weight-decay", type=float, default=1e-4)
-    p.add_argument("--dropout", type=float, default=0.35)
-    p.add_argument("--hidden-dim", type=int, default=320)
-    p.add_argument("--num-layers", type=int, default=2)
-    p.add_argument("--tcn-channels", type=int, default=256)
-    p.add_argument("--kernel-size", type=int, default=5)
-    p.add_argument("--val-ratio", type=float, default=0.2)
-    p.add_argument("--patience", type=int, default=18)
-    p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--label-smoothing", type=float, default=0.08)
-    p.add_argument("--class-weight", action="store_true", help="Use class weights in CrossEntropyLoss.")
-    p.add_argument("--weighted-sampler", action="store_true", help="Use WeightedRandomSampler for imbalanced classes.")
+    p.add_argument("--dropout",      type=float, default=0.35)
+    p.add_argument("--hidden-dim",   type=int,   default=320)
+    p.add_argument("--num-layers",   type=int,   default=2)
+    p.add_argument("--tcn-channels", type=int,   default=256)
+    p.add_argument("--kernel-size",  type=int,   default=5)
+
+    # ── 학습 ──
+    p.add_argument("--val-ratio",        type=float, default=0.2,
+                   help="서명자 분리 미사용 시 val 비율 (기본 0.2)")
+    p.add_argument("--patience",         type=int,   default=18)
+    p.add_argument("--seed",             type=int,   default=42)
+    p.add_argument("--label-smoothing",  type=float, default=0.08)
+    p.add_argument("--class-weight",     action="store_true")
+    p.add_argument("--weighted-sampler", action="store_true")
     p.add_argument("--force-preprocess", action="store_true")
-    p.add_argument("--num-workers", type=int, default=None)
-    p.add_argument("--no-amp", action="store_true")
-    p.add_argument("--grad-clip", type=float, default=1.0)
+    p.add_argument("--num-workers",      type=int,   default=None)
+    p.add_argument("--no-amp",           action="store_true")
+    p.add_argument("--grad-clip",        type=float, default=1.0)
+
+    # ── 서명자 독립 검증 ──
+    p.add_argument("--num-signers",       type=int, default=0,
+                   help="데이터셋 내 전체 서명자 수. 0이면 서명자 분리 비활성화 (기본 0)")
+    p.add_argument("--angles-per-signer", type=int, default=5,
+                   help="서명자 1명당 각도 수 (기본 5). 클래스 내 위치 기반 추론에 사용")
+    p.add_argument("--val-signers",       type=int, default=2,
+                   help="검증에 사용할 서명자 수 (기본 2). num-signers > 0 일 때 활성화")
+    p.add_argument("--signer-key",        type=str, default="",
+                   help="NPZ에서 서명자 ID를 읽을 키 이름 (예: S). 비워두면 자동 탐색")
+
+    # ── 데이터 증강 ──
+    p.add_argument("--aug",            action="store_true",
+                   help="학습 데이터 증강 활성화 (속도·노이즈·크롭). 강력 권장")
+    p.add_argument("--aug-speed-min",  type=float, default=0.8,
+                   help="속도 변환 최솟값 (기본 0.8). 추론 TTA 범위와 맞출 것")
+    p.add_argument("--aug-speed-max",  type=float, default=1.2,
+                   help="속도 변환 최댓값 (기본 1.2)")
+    p.add_argument("--aug-jitter",     type=float, default=0.02,
+                   help="공간 노이즈 std (기본 0.02). 웹캠 키포인트 흔들림 시뮬레이션")
+    p.add_argument("--aug-crop-prob",  type=float, default=0.4,
+                   help="크롭 적용 확률 (기본 0.4). 짧은 녹화 시뮬레이션")
+    p.add_argument("--aug-crop-min",   type=float, default=0.5,
+                   help="크롭 후 최소 유지 비율 (기본 0.5 → 최소 50%%만 유지)")
+
     return p.parse_args()
 
 
@@ -737,7 +945,7 @@ def main():
     set_seed(args.seed)
 
     print("=" * 80)
-    print("KSL Improved Training")
+    print("KSL Improved Training  v3")
     print("=" * 80)
     print(json.dumps(vars(args), indent=2, ensure_ascii=False))
 
@@ -752,6 +960,20 @@ def main():
     else:
         num_workers = args.num_workers
 
+    if args.aug:
+        print(f"[증강] speed=[{args.aug_speed_min}, {args.aug_speed_max}], "
+              f"jitter={args.aug_jitter}, "
+              f"crop_prob={args.aug_crop_prob}, crop_min={args.aug_crop_min}")
+    else:
+        print("[증강] 비활성화  (--aug 추가 강력 권장)")
+
+    if args.num_signers > 0:
+        print(f"[서명자 분리] num_signers={args.num_signers}, "
+              f"angles_per_signer={args.angles_per_signer}, "
+              f"val_signers={args.val_signers}")
+    else:
+        print("[서명자 분리] 비활성화  (--num-signers 16 --val-signers 2 추가 권장)")
+
     train_loader, val_loader, train_labels = build_loaders(
         label_encoder=label_encoder,
         batch_size=args.batch_size,
@@ -759,6 +981,15 @@ def main():
         seed=args.seed,
         num_workers=num_workers,
         use_weighted_sampler=args.weighted_sampler,
+        augment=args.aug,
+        speed_range=(args.aug_speed_min, args.aug_speed_max),
+        jitter_std=args.aug_jitter,
+        crop_prob=args.aug_crop_prob,
+        crop_min=args.aug_crop_min,
+        num_signers=args.num_signers,
+        angles_per_signer=args.angles_per_signer,
+        val_signers=args.val_signers,
+        signer_key=args.signer_key,
     )
 
     print(f"[Data] train={len(train_loader.dataset):,}, val={len(val_loader.dataset):,}")
