@@ -54,16 +54,29 @@ HAND_CONNECTIONS = [
     (0,17),(17,18),(18,19),(19,20)
 ]
 
+def normalize_hand_batch(hand):
+    """
+    hand: (N, T, 21, 3)
+    손목(0) 기준 이동 + 손목~중지MCP(9) 거리로 스케일 정규화
+    → 카메라 거리/위치에 무관한 특징 추출
+    """
+    center = hand[:, :, 0:1, :]                          # (N, T, 1, 3)
+    hand_c = hand - center
+    scale  = np.linalg.norm(hand_c[:, :, 9, :], axis=-1, keepdims=True)  # (N, T, 1)
+    scale  = scale[:, :, :, None]                         # (N, T, 1, 1)
+    return hand_c / (scale + 1e-6)
+
 def extract_features_batch(X_batch):
     """
     X_batch : (N, T, 67, 3) numpy float32
-    반환값  : (N, T, 40)  — 왼손 20 + 오른손 20 관절 각도/거리
+    반환값  : (N, T, 40)  — 왼손 20 + 오른손 20 관절 각도/거리 (스케일 정규화 적용)
     """
     N, T = X_batch.shape[:2]
     features = np.zeros((N, T, FEAT_DIM), dtype=np.float32)
 
     for hand_i, hand_start in enumerate([0, 21]):
         hand = X_batch[:, :, hand_start:hand_start+21, :]  # (N, T, 21, 3)
+        hand = normalize_hand_batch(hand)                   # 정규화
         base = hand_i * 20
 
         for ci, (parent, child) in enumerate(HAND_CONNECTIONS):

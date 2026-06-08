@@ -23,6 +23,7 @@ Dataset_NPZ/
 
 # 전처리 캐시 (수 GB)
 model/feat_cache/
+model/feat_cache_improved/
 
 # Python 캐시
 __pycache__/
