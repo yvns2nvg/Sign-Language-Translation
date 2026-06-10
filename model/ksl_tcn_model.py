@@ -431,79 +431,56 @@ def build_loaders(
     signer_key="",
 ):
     """
-    num_signers > 0 이고 val_signers > 0 이면 서명자 독립 분리를 시도한다.
-    서명자 ID 탐색 순서:
-      1. NPZ에 signer_key (또는 자동 탐색 키)가 있으면 그대로 사용
-      2. 없으면 클래스 내 위치 기반 추론 (build_signer_ids)
-      3. 둘 다 실패하면 기존 랜덤 stratified 분리로 폴백
+    서명자 독립 분리 전략:
+      AI Hub KSL 구조 = NPZ 파일 1개 = 서명자 1명의 데이터
+        (1명 × 5각도 × 3000단어 ≒ 15,000 샘플/파일)
+      따라서 파일 인덱스 = 서명자 ID.
+      마지막 val_signers 개 파일을 검증 세트로 분리.
+
+    val_signers=0 또는 num_signers=0 이면 기존 랜덤 stratified 분리.
     """
     feat_files = sorted([f for f in os.listdir(CACHE_DIR) if f.startswith("feats_") and f.endswith(".npy")])
+    total_files = len(feat_files)
     train_sets, val_sets = [], []
     train_labels_all = []
-    signer_split_used = False
 
-    _SIGNER_KEY_CANDIDATES = (
-        [signer_key] if signer_key
-        else ["S", "signer_id", "signer", "speaker", "person"]
-    )
+    # ── 서명자 독립 분리: 파일 인덱스 기반 ──────────────────────
+    use_signer_split = (num_signers > 0 and val_signers > 0
+                        and val_signers < total_files)
+    if use_signer_split:
+        val_file_indices = set(range(total_files - val_signers, total_files))
+        print(f"[서명자 독립 분리] 전체 {total_files}개 파일(서명자) 중 "
+              f"마지막 {val_signers}개를 검증 세트로 분리")
+        print(f"  val 파일: {sorted(val_file_indices)}  "
+              f"train 파일: 0~{total_files - val_signers - 1}")
+    else:
+        val_file_indices = None
+        print(f"[분리 방식] 랜덤 stratified 분리 (val_ratio={val_ratio})")
 
-    for ff in feat_files:
+    for file_idx, ff in enumerate(feat_files):
         num = ff.split("_")[1].split(".")[0]
         fp = os.path.join(CACHE_DIR, ff)
         lp = os.path.join(CACHE_DIR, f"labels_{num}.npy")
-        sp = os.path.join(CACHE_DIR, f"signers_{num}.npy")
 
         y_str = np.load(lp)
         y = label_encoder.transform(y_str)
         n = len(y)
         indices = np.arange(n)
 
-        # ── 서명자 독립 분리 시도 ──────────────────────────────────
-        use_signer_split = (num_signers > 0 and val_signers > 0
-                            and val_signers < num_signers)
-        signer_ids = None
-
         if use_signer_split:
-            # 1) NPZ 캐시에서 읽기 시도
-            if os.path.exists(sp):
-                signer_ids = np.load(sp)
+            if file_idx in val_file_indices:
+                # 이 파일 전체 → 검증 세트
+                val_sets.append(KSLDataset(fp, lp, label_encoder, indices))
             else:
-                # 2) NPZ 원본에서 읽기 시도
-                npz_files = sorted([f for f in os.listdir(DATA_ROOT) if f.endswith(".npz")])
-                npz_path = os.path.join(DATA_ROOT, npz_files[int(num)])
-                try:
-                    data_tmp = np.load(npz_path, allow_pickle=True)
-                    for key in _SIGNER_KEY_CANDIDATES:
-                        if key and key in data_tmp:
-                            signer_ids = np.array(data_tmp[key], dtype=np.int32)
-                            np.save(sp, signer_ids)
-                            print(f"  [서명자] NPZ 키 '{key}' 발견 → 캐시 저장")
-                            break
-                except Exception:
-                    pass
-
-            # 3) 위치 기반 추론 (폴백)
-            if signer_ids is None:
-                signer_ids = build_signer_ids(y_str, num_signers, angles_per_signer)
-                np.save(sp, signer_ids)
-                if not signer_split_used:
-                    print(f"  [서명자] 키 없음 → 클래스 내 위치 기반 서명자 ID 추론 "
-                          f"(num_signers={num_signers}, angles_per_signer={angles_per_signer})")
-
-            # 마지막 val_signers 명을 검증 세트로 분리
-            val_set_ids = set(range(num_signers - val_signers, num_signers))
-            train_mask = np.array([sid not in val_set_ids for sid in signer_ids])
-            train_idx = indices[train_mask]
-            val_idx = indices[~train_mask]
-
-            if not signer_split_used:
-                print(f"  [서명자 분리] 전체 {num_signers}명 중 val {val_signers}명 분리 "
-                      f"(signer ID {num_signers - val_signers}~{num_signers - 1})")
-                print(f"  train={len(train_idx):,}  val={len(val_idx):,} (파일 {ff})")
-                signer_split_used = True
-
-        # ── 폴백: 기존 랜덤 stratified 분리 ──────────────────────
-        if signer_ids is None or not use_signer_split:
+                # 이 파일 전체 → 학습 세트
+                train_sets.append(KSLDataset(
+                    fp, lp, label_encoder, indices,
+                    augment=augment, speed_range=speed_range,
+                    jitter_std=jitter_std, crop_prob=crop_prob, crop_min=crop_min,
+                ))
+                train_labels_all.extend(y.tolist())
+        else:
+            # ── 폴백: 랜덤 stratified 분리 ──
             try:
                 train_idx, val_idx = train_test_split(
                     indices, test_size=val_ratio, random_state=seed,
@@ -515,16 +492,13 @@ def build_loaders(
                 cut = int(n * (1.0 - val_ratio))
                 train_idx, val_idx = idx[:cut], idx[cut:]
 
-            if not signer_split_used and not use_signer_split:
-                print("  [분리 방식] 랜덤 stratified 분리 (--num-signers 미지정)")
-
-        train_sets.append(KSLDataset(
-            fp, lp, label_encoder, train_idx,
-            augment=augment, speed_range=speed_range,
-            jitter_std=jitter_std, crop_prob=crop_prob, crop_min=crop_min,
-        ))
-        val_sets.append(KSLDataset(fp, lp, label_encoder, val_idx))
-        train_labels_all.extend(y[train_idx].tolist())
+            train_sets.append(KSLDataset(
+                fp, lp, label_encoder, train_idx,
+                augment=augment, speed_range=speed_range,
+                jitter_std=jitter_std, crop_prob=crop_prob, crop_min=crop_min,
+            ))
+            val_sets.append(KSLDataset(fp, lp, label_encoder, val_idx))
+            train_labels_all.extend(y[train_idx].tolist())
 
     train_ds = ConcatDataset(train_sets)
     val_ds = ConcatDataset(val_sets)
