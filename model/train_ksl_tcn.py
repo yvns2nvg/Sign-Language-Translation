@@ -36,7 +36,6 @@ from torch.utils.data import Dataset, DataLoader, ConcatDataset, WeightedRandomS
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 from sklearn.preprocessing import LabelEncoder
-from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report, confusion_matrix, f1_score
 
 
@@ -67,28 +66,20 @@ def set_seed(seed: int = 42):
 # -----------------------------------------------------------------------------
 # Preprocessing and dataset
 # -----------------------------------------------------------------------------
-def preprocess(force: bool = False, signer_key: str = ""):
-    """
-    NPZ → (features, labels, [signers]) 캐시 생성.
-    signer_key: NPZ에서 서명자 ID를 읽을 키 이름 (예: "S", "signer_id").
-                비어 있으면 공통 키 이름을 자동으로 시도.
-    """
+def preprocess(force: bool = False):
+    """NPZ → (features, labels) 캐시 생성. 파일 1개 = 서명자 1명."""
     os.makedirs(CACHE_DIR, exist_ok=True)
     npz_files = sorted([f for f in os.listdir(DATA_ROOT) if f.endswith(".npz")])
     if not npz_files:
         raise FileNotFoundError(f"NPZ files not found: {DATA_ROOT}")
 
-    print(f"[Preprocess] NPZ {len(npz_files)} files -> {CACHE_DIR}")
+    print(f"[Preprocess] NPZ {len(npz_files)}개 파일 (서명자 {len(npz_files)}명) → {CACHE_DIR}")
     total_t = time.time()
-
     meta = {"files": [], "feature_dim": None}
 
-    _SIGNER_KEY_CANDIDATES = [signer_key] if signer_key else ["S", "signer_id", "signer", "speaker", "person"]
-
     for i, fname in enumerate(npz_files):
-        feat_path   = os.path.join(CACHE_DIR, f"feats_{i:02d}.npy")
-        lbl_path    = os.path.join(CACHE_DIR, f"labels_{i:02d}.npy")
-        signer_path = os.path.join(CACHE_DIR, f"signers_{i:02d}.npy")
+        feat_path = os.path.join(CACHE_DIR, f"feats_{i:02d}.npy")
+        lbl_path  = os.path.join(CACHE_DIR, f"labels_{i:02d}.npy")
 
         if not force and os.path.exists(feat_path) and os.path.exists(lbl_path):
             arr = np.load(feat_path, mmap_mode="r")
@@ -97,22 +88,14 @@ def preprocess(force: bool = False, signer_key: str = ""):
             print(f"  [{i+1}/{len(npz_files)}] {fname} - cache exists {arr.shape}")
             continue
 
-        t0 = time.time()
+        t0   = time.time()
         data = np.load(os.path.join(DATA_ROOT, fname), allow_pickle=True)
-        X = data["X"].astype(np.float32)
-        y = np.array([str(v) for v in data["V"]])
-
-        # 서명자 ID 저장 시도
-        if not os.path.exists(signer_path) or force:
-            for key in _SIGNER_KEY_CANDIDATES:
-                if key and key in data:
-                    np.save(signer_path, np.array(data[key]))
-                    print(f"    서명자 ID 저장: key='{key}', {len(data[key])} samples")
-                    break
+        X    = data["X"].astype(np.float32)
+        y    = np.array([str(v) for v in data["V"]])
 
         feats = extract_improved_features_batch(X)
         np.save(feat_path, feats)
-        np.save(lbl_path, y)
+        np.save(lbl_path,  y)
 
         meta["files"].append({"name": fname, "shape": tuple(feats.shape)})
         meta["feature_dim"] = int(feats.shape[-1])
@@ -230,86 +213,55 @@ class KSLDataset(Dataset):
         return torch.from_numpy(x).float(), int(self.y[ri])
 
 
-def _signer_split(indices, signer_ids, num_val_signers: int, seed: int):
-    """서명자 단위 학습/검증 분리."""
-    unique = np.unique(signer_ids)
-    rng = np.random.default_rng(seed)
-    shuffled = rng.permutation(unique)
-    n_val = max(1, min(num_val_signers, len(unique) // 5))
-    val_set = set(shuffled[:n_val].tolist())
-    train_mask = np.array([s not in val_set for s in signer_ids])
-    return indices[train_mask], indices[~train_mask], len(unique), n_val
-
-
 def build_loaders(
     label_encoder,
     batch_size: int,
-    val_ratio: float,
     seed: int,
     num_workers: int,
     use_weighted_sampler: bool,
     augment: bool = False,
     speed_range: tuple = (0.8, 1.2),
     jitter_std: float = 0.01,
-    num_val_signers: int = 3,
+    num_val_files: int = 3,
 ):
+    """
+    파일(= 서명자) 단위 서명자 독립 분리.
+    num_val_files개 파일은 검증 전용, 나머지는 학습 전용.
+    """
     feat_files = sorted(
         [f for f in os.listdir(CACHE_DIR) if f.startswith("feats_") and f.endswith(".npy")]
     )
+
+    # 서명자(파일) 단위 분리
+    rng = np.random.default_rng(seed)
+    shuffled = rng.permutation(feat_files).tolist()
+    n_val = max(1, min(num_val_files, len(shuffled) - 1))
+    val_file_set  = set(shuffled[:n_val])
+    train_file_set = set(shuffled[n_val:])
+
+    print(f"  [서명자 독립 분리] 전체 {len(feat_files)}명 → 학습 {len(train_file_set)}명 / 검증 {n_val}명")
+    print(f"    검증 파일: {sorted(val_file_set)}")
+
     train_sets, val_sets = [], []
     train_labels_all = []
-    signer_split_used = False
 
     for ff in feat_files:
         num = ff.split("_")[1].split(".")[0]
-        fp = os.path.join(CACHE_DIR, ff)
-        lp = os.path.join(CACHE_DIR, f"labels_{num}.npy")
-        sp = os.path.join(CACHE_DIR, f"signers_{num}.npy")
+        fp  = os.path.join(CACHE_DIR, ff)
+        lp  = os.path.join(CACHE_DIR, f"labels_{num}.npy")
 
-        y_str = np.load(lp)
-        y     = label_encoder.transform(y_str)
-        n     = len(y)
-        indices = np.arange(n)
+        y_str   = np.load(lp)
+        y       = label_encoder.transform(y_str)
+        indices = np.arange(len(y))
 
-        # ── 서명자 독립 분리 (signer ID 캐시가 있을 때) ──
-        if os.path.exists(sp):
-            signer_ids = np.load(sp)
-            train_idx, val_idx, n_total, n_val = _signer_split(
-                indices, signer_ids, num_val_signers, seed
-            )
-            if not signer_split_used:
-                print(f"  [서명자 분리] 총 {n_total}명, val {n_val}명 (서명자 독립)")
-                signer_split_used = True
+        if ff in val_file_set:
+            val_sets.append(KSLDataset(fp, lp, label_encoder, indices, augment=False))
         else:
-            # ── 폴백: 랜덤 stratified split ──
-            try:
-                train_idx, val_idx = train_test_split(
-                    indices,
-                    test_size=val_ratio,
-                    random_state=seed,
-                    shuffle=True,
-                    stratify=y,
-                )
-            except ValueError:
-                rng = np.random.default_rng(seed)
-                idx = rng.permutation(n)
-                cut = int(n * (1.0 - val_ratio))
-                train_idx, val_idx = idx[:cut], idx[cut:]
-
-        train_sets.append(
-            KSLDataset(
-                fp, lp, label_encoder, train_idx,
-                augment=augment, speed_range=speed_range, jitter_std=jitter_std,
+            train_sets.append(
+                KSLDataset(fp, lp, label_encoder, indices,
+                           augment=augment, speed_range=speed_range, jitter_std=jitter_std)
             )
-        )
-        val_sets.append(
-            KSLDataset(fp, lp, label_encoder, val_idx, augment=False)
-        )
-        train_labels_all.extend(y[train_idx].tolist())
-
-    if not signer_split_used:
-        print("  [경고] 서명자 ID 캐시 없음 → 랜덤 분리 사용 (서명자 의존 평가)")
-        print("         재학습 시 --signer-key 옵션으로 서명자 키를 지정하세요.")
+            train_labels_all.extend(y.tolist())
 
     train_ds = ConcatDataset(train_sets)
     val_ds   = ConcatDataset(val_sets)
@@ -633,7 +585,6 @@ def parse_args():
     p.add_argument("--kernel-size",  type=int,   default=5)
 
     # 학습 설정
-    p.add_argument("--val-ratio",         type=float, default=0.2)
     p.add_argument("--patience",          type=int,   default=18)
     p.add_argument("--seed",              type=int,   default=42)
     p.add_argument("--label-smoothing",   type=float, default=0.08)
@@ -662,15 +613,10 @@ def parse_args():
         help="공간 노이즈 표준편차 (기본 0.01). 0이면 비활성화."
     )
 
-    # ── 서명자 독립 분리 (v2 신규) ────────────────────────────
+    # ── 서명자 독립 분리 (파일 단위, v2 신규) ─────────────────
     p.add_argument(
-        "--signer-key", type=str, default="",
-        help="NPZ에서 서명자 ID를 읽을 키 이름 (예: S, signer_id). "
-             "비워두면 S/signer_id/signer/speaker 순으로 자동 시도."
-    )
-    p.add_argument(
-        "--num-val-signers", type=int, default=3,
-        help="검증에 사용할 서명자 수 (기본 3). 전체 서명자의 최대 20%%까지 허용."
+        "--num-val-files", type=int, default=3,
+        help="검증에 사용할 서명자(파일) 수 (기본 3). 파일 1개 = 서명자 1명."
     )
 
     return p.parse_args()
@@ -690,7 +636,7 @@ def main():
 
     assert os.path.isdir(DATA_ROOT), f"Dataset folder not found: {DATA_ROOT}"
 
-    input_dim     = preprocess(force=args.force_preprocess, signer_key=args.signer_key)
+    input_dim     = preprocess(force=args.force_preprocess)
     label_encoder = build_label_encoder()
     num_classes   = len(label_encoder.classes_)
 
@@ -707,14 +653,13 @@ def main():
     train_loader, val_loader, train_labels = build_loaders(
         label_encoder=label_encoder,
         batch_size=args.batch_size,
-        val_ratio=args.val_ratio,
         seed=args.seed,
         num_workers=num_workers,
         use_weighted_sampler=args.weighted_sampler,
         augment=args.aug,
         speed_range=(args.aug_speed_min, args.aug_speed_max),
         jitter_std=args.aug_jitter,
-        num_val_signers=args.num_val_signers,
+        num_val_files=args.num_val_files,
     )
 
     print(f"[Data] train={len(train_loader.dataset):,}, val={len(val_loader.dataset):,}")
