@@ -88,3 +88,32 @@ def featurize(seq_xy: np.ndarray, t_out: int = 64,
 
 
 FEATURE_DIM = 89 * 2 * 2  # 356
+N_POINTS = FEATURE_DIM // 4  # 89
+
+
+def unpack_position(feat):
+    """(..., T, 356) -> (..., T, 89, 2) 위치 채널만 (torch/np 둘 다 동작).
+
+    kslx.augment 와 kslx.eval_robust 가 이미 정규화+리샘플된 피처의 위치 성분에
+    변형을 걸 때 공용으로 쓴다 (속도는 변형 후 repack_from_position 이 다시 계산).
+    """
+    *lead, t, _ = feat.shape
+    pos_flat = feat[..., : N_POINTS * 2]
+    return pos_flat.reshape(*lead, t, N_POINTS, 2)
+
+
+def repack_from_position(pos):
+    """(..., T, 89, 2) -> (..., T, 356). 속도는 여기서 재계산한다."""
+    import torch as _torch
+    if isinstance(pos, _torch.Tensor):
+        vel = _torch.zeros_like(pos)
+        vel[..., 1:, :, :] = pos[..., 1:, :, :] - pos[..., :-1, :, :]
+        cat = _torch.cat
+    else:
+        vel = np.zeros_like(pos)
+        vel[..., 1:, :, :] = pos[..., 1:, :, :] - pos[..., :-1, :, :]
+        cat = np.concatenate
+    *lead, t, p, c = pos.shape
+    pos_flat = pos.reshape(*lead, t, p * c)
+    vel_flat = vel.reshape(*lead, t, p * c)
+    return cat([pos_flat, vel_flat], axis=-1)

@@ -17,6 +17,7 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
+from kslx.augment import augment_features
 from kslx.models.conv_transformer import ConvTransformer, count_params
 from kslx.splits import PROTOCOLS, SplitError
 
@@ -42,7 +43,7 @@ def topk_accuracy(logits: torch.Tensor, target: torch.Tensor, ks=(1, 5)) -> dict
 
 def run_protocol(protocol: str, X, y, clips: list[ClipMeta], num_classes: int,
                   device: str, epochs: int, batch_size: int, lr: float,
-                  seed: int, protocol_kwargs: dict) -> dict:
+                  seed: int, protocol_kwargs: dict, augment: bool = False) -> dict:
     split_fn = PROTOCOLS[protocol]
     train_idx, val_idx = split_fn(clips, **protocol_kwargs)
 
@@ -62,12 +63,15 @@ def run_protocol(protocol: str, X, y, clips: list[ClipMeta], num_classes: int,
     best_state = None
     x_val_dev = x_val.to(device)
     y_val_dev = y_val.to(device)
+    aug_rng = np.random.default_rng(seed)
 
     for epoch in range(epochs):
         model.train()
         epoch_loss = 0.0
         n_batches = 0
         for xb, yb in train_loader:
+            if augment:
+                xb = augment_features(xb, aug_rng)
             xb, yb = xb.to(device), yb.to(device)
             opt.zero_grad()
             logits = model(xb)
@@ -113,6 +117,7 @@ def main():
     ap.add_argument("--val-ratio", type=float, default=0.15)
     ap.add_argument("--n-val-signers", type=int, default=3)
     ap.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--aug", action="store_true", help="학습 배치에 실시간 증강 적용 (kslx.augment)")
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -142,7 +147,8 @@ def main():
         t0 = time.time()
         try:
             res = run_protocol(protocol, X, y, clips, num_classes, args.device,
-                                args.epochs, args.batch_size, args.lr, args.seed, kwargs)
+                                args.epochs, args.batch_size, args.lr, args.seed, kwargs,
+                                augment=args.aug)
         except SplitError as e:
             print(f"  [SKIP] {protocol}: {e}")
             results.append({"protocol": protocol, "error": str(e)})

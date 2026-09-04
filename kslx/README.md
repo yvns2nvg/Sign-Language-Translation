@@ -1,5 +1,7 @@
 # kslx — 누수 없는 재설계 파이프라인
 
+전체 실험 결과와 수치는 [`RESULTS.md`](RESULTS.md) 에 정리돼 있다.
+
 `model/` (기존 TCN, 3000클래스 val 99.6%)의 val 분할이 데이터 누수라는 게
 데이터만으로 증명됐다: 같은 take(수어사×단어)의 5개 카메라 앵글(F/D/L/R/U)
 파일에 든 3D 키포인트가 비트 단위로 동일하다 — 멀티뷰 삼각측량 결과 하나를
@@ -35,7 +37,9 @@ python -m kslx.train --data data/kslx/word_271.npz \
 python -m kslx.eval_robust --data data/kslx/word_271.npz --ckpt runs/signer_out_base.pt
 ```
 
-학습 결과(signer_out 정확도 등)는 확보되는 대로 별도 커밋/PR 코멘트로 추가한다.
+전체 결과(4개 프로토콜, 증강 전/후 강건성 비교)는 [`RESULTS.md`](RESULTS.md) 참고.
+**최종 추천 체크포인트는 `runs/signer_out_aug.pt`** (signer_out top-1 97.8%,
+모든 강건성 변형에서 1%p 이내 열화).
 
 ## 웹캠 실시간 검증 (`realtime.py`)
 
@@ -46,20 +50,20 @@ python -m kslx.eval_robust --data data/kslx/word_271.npz --ckpt runs/signer_out_
 서브샘플링한 근사치**라 학습 시 얼굴 좌표와 완전히 일치하진 않는다 (미검증,
 성능이 이상하면 `--no-face` 로 먼저 비교할 것).
 
+체크포인트(`runs/signer_out_aug.pt`)와 MediaPipe 모델 번들
+(`kslx/mp_models/holistic_landmarker.task`)은 **이 저장소에 이미 포함돼 있다**
+— 클론 후 별도 다운로드 없이 바로 실행 가능하다.
+
 ```bash
 pip install torch opencv-python mediapipe pillow numpy
 
-# MediaPipe Holistic Landmarker 모델 번들 (~13MB, 저장소에는 커밋 안 함)
-curl -L -o kslx/mp_models/holistic_landmarker.task ^
-    https://storage.googleapis.com/mediapipe-models/holistic_landmarker/holistic_landmarker/float16/latest/holistic_landmarker.task
-
-python -m kslx.realtime --ckpt runs/signer_out_base.pt
+python -m kslx.realtime --ckpt runs/signer_out_aug.pt
 ```
 
 조작: `SPACE` 녹화 시작/중지 → 예측(상위 5개 + 확률, 한글) | `R` 취소 | `Q`/`ESC` 종료.
 
-체크포인트(`runs/*.pt`)는 저장소에 커밋하지 않는다 (`.gitignore`). 학습 후 직접
-생성하거나 GitHub Release/공유 드라이브로 전달할 것.
+다른 체크포인트로 직접 학습한 경우가 아니면 `runs/*.pt` 는 커밋하지 않는다
+(`.gitignore` — `signer_out_aug.pt` 하나만 예외로 포함돼 있다).
 
 ## 파일 지도
 
@@ -71,11 +75,14 @@ kslx/
 │                              ★ 어깨 동시 미검출 시 클립 중앙값으로 fallback
 │                              (고정 최솟값으로 나누면 좌표가 폭발하는 버그를 수정함)
 ├── splits.py                  분할 프로토콜 + 사후 감사(leak 있으면 에러)
-├── train.py                   학습 + 프로토콜 비교
+├── augment.py                  학습 배치 증강 (미러/회전/전단/스케일/노이즈/손 결측)
+│                              ★ 이거 없으면 손 결측 시 정확도가 14%로 붕괴함 (RESULTS.md §5-6)
+├── train.py                   학습 + 프로토콜 비교 (--aug 로 증강 on/off)
 ├── leak_report.py              데이터만으로 누수 정량화 (원본 JSON 스캔)
 ├── leak_report_npz.py          동일 주장을 별도로 만들어진 npz 캐시로 독립 재확인
 ├── eval_robust.py              강건성 평가 — 모델 선택은 이걸로
 ├── realtime.py                 웹캠 데모 (Windows, SPACE 녹화)
+│                              runs/signer_out_aug.pt + mp_models/*.task 이미 포함
 ├── models/conv_transformer.py  1D DepthwiseConv + Transformer, ~1.1M params
 ├── adapters/mediapipe_adapter.py  MediaPipe → 89점 레이아웃 변환 (얼굴은 근사)
 └── data/

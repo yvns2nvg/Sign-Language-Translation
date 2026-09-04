@@ -46,9 +46,9 @@ def _repack(pos: np.ndarray) -> np.ndarray:
 
 def perturb_shear(pos: np.ndarray, deg: float, rng: np.random.Generator) -> np.ndarray:
     k = math.tan(math.radians(deg))
-    sign = rng.choice([-1.0, 1.0], size=(pos.shape[0], 1, 1))
+    sign = rng.choice([-1.0, 1.0], size=(pos.shape[0], 1, 1))  # (N,1,1) broadcasts vs (N,T,89)
     out = pos.copy()
-    out[..., 0] = pos[..., 0] + sign[..., 0] * k * pos[..., 1]
+    out[..., 0] = pos[..., 0] + sign * k * pos[..., 1]
     return out
 
 
