@@ -1,0 +1,85 @@
+# kslx — 누수 없는 재설계 파이프라인
+
+`model/` (기존 TCN, 3000클래스 val 99.6%)의 val 분할이 데이터 누수라는 게
+데이터만으로 증명됐다: 같은 take(수어사×단어)의 5개 카메라 앵글(F/D/L/R/U)
+파일에 든 3D 키포인트가 비트 단위로 동일하다 — 멀티뷰 삼각측량 결과 하나를
+5개 파일에 복사해 넣은 것이다. 랜덤 분할에서는 val 샘플의 다른-앵글 사본이
+train 에 그대로 들어가 있으니 정확도가 부풀려진다.
+
+`kslx/` 는 `model/` 을 건드리지 않고 병렬로 만든 새 패키지다. 원칙:
+
+- **3D 키포인트를 쓰지 않는다.** `*_keypoints_2d` 만 쓴다 (`layout.py` 상단 주석).
+- **분할 프로토콜을 이름으로 명시한다** (`splits.py`): `random`(기존 방식, 참고용),
+  `take_out`, `angle_out`, `signer_out`(실사용 성능에 가장 가까움). 조건이 안 맞으면
+  (예: 수어사 1명뿐이라 signer_out 불가) 조용히 이상한 숫자를 내는 대신
+  `SplitError` 를 던진다.
+- **모델 없이 데이터만으로 누수를 정량화한다** (`leak_report.py`).
+
+## 빠른 시작
+
+```bash
+pip install torch numpy mediapipe opencv-python pillow
+
+# 1) AI Hub WORD 키포인트 JSON → npz 캐시
+python -m kslx.data.build_dataset --root <004.수어영상 경로> \
+    --out data/kslx/word_271.npz --signers 1-16 --words 1-271 --workers 14
+
+# 2) 데이터만으로 누수 증명 (모델 불필요)
+python -m kslx.leak_report --root <004.수어영상 경로> --signers 1-16 --words 1-271
+
+# 3) 4개 분할 프로토콜 학습 + 비교
+python -m kslx.train --data data/kslx/word_271.npz \
+    --protocol random take_out angle_out signer_out --epochs 100 --tag base
+
+# 4) 강건성 평가 (yaw/회전/손 결측/스케일/노이즈/속도) — 모델 선택은 이걸로
+python -m kslx.eval_robust --data data/kslx/word_271.npz --ckpt runs/signer_out_base.pt
+```
+
+학습 결과(signer_out 정확도 등)는 확보되는 대로 별도 커밋/PR 코멘트로 추가한다.
+
+## 웹캠 실시간 검증 (`realtime.py`)
+
+학습 데이터는 AI Hub 5카메라 원본(OpenPose 포맷: pose25+hand21×2+face70)이고
+웹캠은 MediaPipe(pose33+hand21×2+face478)를 쓰므로 인덱스 체계가 다르다.
+`adapters/mediapipe_adapter.py` 가 이 변환을 맡는다 — pose/hand 는 관절 대응이
+명확해 신뢰도가 높고, **얼굴 34점은 MediaPipe 공식 얼굴 영역 상수에서 균등
+서브샘플링한 근사치**라 학습 시 얼굴 좌표와 완전히 일치하진 않는다 (미검증,
+성능이 이상하면 `--no-face` 로 먼저 비교할 것).
+
+```bash
+pip install torch opencv-python mediapipe pillow numpy
+
+# MediaPipe Holistic Landmarker 모델 번들 (~13MB, 저장소에는 커밋 안 함)
+curl -L -o kslx/mp_models/holistic_landmarker.task ^
+    https://storage.googleapis.com/mediapipe-models/holistic_landmarker/holistic_landmarker/float16/latest/holistic_landmarker.task
+
+python -m kslx.realtime --ckpt runs/signer_out_base.pt
+```
+
+조작: `SPACE` 녹화 시작/중지 → 예측(상위 5개 + 확률, 한글) | `R` 취소 | `Q`/`ESC` 종료.
+
+체크포인트(`runs/*.pt`)는 저장소에 커밋하지 않는다 (`.gitignore`). 학습 후 직접
+생성하거나 GitHub Release/공유 드라이브로 전달할 것.
+
+## 파일 지도
+
+```
+kslx/
+├── layout.py                  키포인트 레이아웃 (89점: pose13 + 손21×2 + 얼굴34)
+│                              ★ 3D 를 쓰면 안 되는 이유가 상단 주석에 있음
+├── normalize.py               정규화(목 원점 + 어깨너비 스케일) · 리샘플 · 속도특징
+│                              ★ 어깨 동시 미검출 시 클립 중앙값으로 fallback
+│                              (고정 최솟값으로 나누면 좌표가 폭발하는 버그를 수정함)
+├── splits.py                  분할 프로토콜 + 사후 감사(leak 있으면 에러)
+├── train.py                   학습 + 프로토콜 비교
+├── leak_report.py              데이터만으로 누수 정량화 (원본 JSON 스캔)
+├── leak_report_npz.py          동일 주장을 별도로 만들어진 npz 캐시로 독립 재확인
+├── eval_robust.py              강건성 평가 — 모델 선택은 이걸로
+├── realtime.py                 웹캠 데모 (Windows, SPACE 녹화)
+├── models/conv_transformer.py  1D DepthwiseConv + Transformer, ~1.1M params
+├── adapters/mediapipe_adapter.py  MediaPipe → 89점 레이아웃 변환 (얼굴은 근사)
+└── data/
+    ├── aihub.py                JSON 스캐너 + 로더 + 형태소(수어구간) 파서
+    ├── build_dataset.py        npz 캐시 빌더 (멀티프로세스)
+    └── word_labels.json        WORD#### → 한글 (3000단어)
+```

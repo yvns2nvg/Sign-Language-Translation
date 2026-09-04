@@ -44,3 +44,13 @@ __pycache__/
 # OS
 .DS_Store
 Thumbs.db
+
+# kslx (누수 없는 재설계 파이프라인) — 모델 번들/체크포인트/실행 산출물
+kslx/mp_models/*.task
+runs/
+train_log.txt
+build_log.txt
+
+# 위 "data/" 규칙이 kslx/data/ (소스 코드+라벨 매핑, 캐시 아님) 까지 가리므로 예외 처리
+!kslx/data/
+!kslx/data/**
