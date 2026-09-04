@@ -60,7 +60,16 @@ pip install torch opencv-python mediapipe pillow numpy
 python -m kslx.realtime --ckpt runs/signer_out_aug.pt
 ```
 
-조작: `SPACE` 녹화 시작/중지 → 예측(상위 5개 + 확률, 한글) | `R` 취소 | `Q`/`ESC` 종료.
+기본은 `--mode auto`: 손 움직임 에너지로 "단어 끝 → 다음 단어 시작"을 자동
+감지해서(`kslx/stream.py`) 매번 SPACE를 누를 필요 없이 이어서 인식한다.
+`--mode manual` 로 기존 SPACE 방식도 가능하고, 실행 중 `M` 키로 전환된다.
+조작: `SPACE`(manual: 녹화 시작/중지, auto: 현재 구간 강제 종료) | `M` 모드 전환 |
+`R` 취소 | `Q`/`ESC` 종료.
+
+★ 자동 분할은 정식 학습된 경계 검출기가 아니라 휴리스틱이다 — 카메라가 손을
+순간적으로 놓치면 단어가 중간에 잘못 끊길 수 있다. 화면에 뜨는 `energy` 값을
+보면서 `--start-energy`/`--end-energy`/`--end-hold` 를 조정하거나, 안 될 때는
+`--mode manual` 로 돌아갈 것 (`kslx/stream.py` 상단 주석 참고).
 
 다른 체크포인트로 직접 학습한 경우가 아니면 `runs/*.pt` 는 커밋하지 않는다
 (`.gitignore` — `signer_out_aug.pt` 하나만 예외로 포함돼 있다).
@@ -81,7 +90,8 @@ kslx/
 ├── leak_report.py              데이터만으로 누수 정량화 (원본 JSON 스캔)
 ├── leak_report_npz.py          동일 주장을 별도로 만들어진 npz 캐시로 독립 재확인
 ├── eval_robust.py              강건성 평가 — 모델 선택은 이걸로
-├── realtime.py                 웹캠 데모 (Windows, SPACE 녹화)
+├── stream.py                    에너지 기반 자동 단어 경계 감지 (휴리스틱, 미검증)
+├── realtime.py                 웹캠 데모 (Windows, 기본 auto/M으로 manual 전환)
 │                              runs/signer_out_aug.pt + mp_models/*.task 이미 포함
 ├── models/conv_transformer.py  1D DepthwiseConv + Transformer, ~1.1M params
 ├── adapters/mediapipe_adapter.py  MediaPipe → 89점 레이아웃 변환 (얼굴은 근사)

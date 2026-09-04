@@ -163,8 +163,20 @@ pip install torch opencv-python mediapipe pillow numpy
 python -m kslx.realtime --ckpt runs/signer_out_aug.pt
 ```
 
-조작: `SPACE` 녹화 시작/중지 → 예측(상위 5개+확률, 한글) | `R` 취소 |
-`Q`/`ESC` 종료.
+기본은 `--mode auto`: `kslx/stream.py`의 `SegmentGate`가 양손 이동량(에너지)을
+프레임마다 재서 "에너지가 시작 임계값을 넘으면 녹화 시작, 저에너지가
+`end_hold` 프레임만큼 이어지면 그 단어가 끝난 것으로 보고 자동 예측"하는
+식으로 매번 SPACE를 누르지 않아도 이어서 인식하게 했다. `--mode manual` 로
+기존 SPACE 방식도 유지되고, 실행 중 `M` 키로 전환된다.
+
+★ 이건 정식 학습된 경계 검출기가 아니라 휴리스틱이다(§8 참고). 카메라가
+손을 순간적으로 놓치면 에너지가 잘못 떨어져 단어가 중간에 끊길 수 있다.
+화면에 실시간 `energy` 값이 표시되니 그걸 보면서 `--start-energy`/
+`--end-energy`/`--end-hold` 를 조정하거나, 안 맞으면 `--mode manual` 로
+돌아갈 것.
+
+조작: `SPACE`(manual: 녹화 시작/중지, auto: 현재 구간 강제 종료) | `M` 모드
+전환 | `R` 취소 | `Q`/`ESC` 종료.
 
 체크포인트(`runs/signer_out_aug.pt`)와 MediaPipe 모델 번들
 (`kslx/mp_models/holistic_landmarker.task`)은 저장소에 이미 포함돼 있다 —
@@ -176,7 +188,11 @@ python -m kslx.realtime --ckpt runs/signer_out_aug.pt
   오차 측정 — `004.수어영상/1.Training/원천데이터`에 원본 영상 있음).
 - 271단어 → 3000단어 전체 확장 (현재는 처리 시간 때문에 271개로 제한).
 - 문장(SEN) 데이터로 확장 — 비수지 신호(얼굴)의 진가는 문장 번역에서 나온다.
-- 스트리밍 연속 인식(README.md의 기존 `stream.py`/`eval_stream.py` 설계,
-  background 클래스 + confidence threshold) — 이번 세션 범위 밖.
+- **`kslx/stream.py`의 자동 분할은 에너지 휴리스틱이다.** 로컬 README.md가
+  설계했던 원안(학습된 background 클래스로 프레임 단위 수어/무동작 분류 +
+  `conf_threshold` 튜닝 + `eval_stream`으로 WER 측정)이 훨씬 견고하다 —
+  `Dataset.background_spans()`에 준하는 무동작 구간 데이터도 이미
+  `kslx.data.aihub.load_sign_span()`으로 뽑을 수 있으니, 다음 단계는 이걸로
+  background 클래스를 학습에 추가하고 WER로 정량 평가하는 것.
 - take_out(92.4~93.6%)이 signer_out(97.8~98.5%)보다 낮게 나온 게 다소
   직관에 반한다 — 단일 시드 결과라 여러 시드로 재확인 권장.
