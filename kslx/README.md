@@ -41,6 +41,11 @@ python -m kslx.eval_robust --data data/kslx/word_271.npz --ckpt runs/signer_out_
 **최종 추천 체크포인트는 `runs/signer_out_aug.pt`** (signer_out top-1 97.8%,
 모든 강건성 변형에서 1%p 이내 열화).
 
+★ **이 체크포인트는 [`VOCAB_271.txt`](VOCAB_271.txt)에 있는 271단어만 인식할 수 있다.**
+목록에 없는 단어를 수어로 하면 모델이 이 271개 중 하나를 억지로 골라
+답하므로 반드시 틀린다 — 웹캠 테스트는 꼭 이 목록 안의 단어로 할 것.
+대부분 명사(의료/음식/학교/행정/지명/종교)이고 동사·형용사는 몇 개 안 된다.
+
 ## 웹캠 실시간 검증 (`realtime.py`)
 
 학습 데이터는 AI Hub 5카메라 원본(OpenPose 포맷: pose25+hand21×2+face70)이고
