@@ -72,6 +72,16 @@ python -m kslx.realtime --ckpt runs/signer_out_aug.pt
 보면서 `--start-energy`/`--end-energy`/`--end-hold` 를 조정하거나, 안 될 때는
 `--mode manual` 로 돌아갈 것 (`kslx/stream.py` 상단 주석 참고).
 
+### 웹캠 단어 인식이 안 좋을 때
+
+실행하면 먼저 "보정 중..." 화면이 뜬다 — 어깨가 보이게 몇 초 서 있으면
+자동으로 넘어간다(스킵하려면 `--no-calibrate`). 또 MediaPipe 키포인트
+지터를 줄이는 One-Euro 스무딩 필터가 기본 켜져 있다(`--no-smooth`로 끄기,
+`--min-cutoff`/`--beta`로 세기 조절). 그래도 인식이 안 좋으면 `RESULTS.md`
+§10(웹캠 인식 품질)에 원인 분석과 튜닝 가이드를 정리해뒀다 — 요약하면
+**OpenPose(학습 데이터)를 MediaPipe(웹캠)로 대체하면 정확도가 떨어지는 건
+수어인식 연구에서도 보고된 현상**이라 어느 정도는 각오해야 한다.
+
 ### 단어 → 문장 (`sentence.py`)
 
 수어는 한국어를 그대로 옮긴 게 아니라 조사/어미가 거의 없는 독립 문법을

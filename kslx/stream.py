@@ -24,21 +24,70 @@ from kslx.layout import POSE13_NECK_IDX, POSE13_R_SHOULDER_IDX, POSE13_L_SHOULDE
 class LiveNormalizer:
     """실시간용 프레임 단위 목-원점/어깨너비 정규화. 클립 전체를 미리 볼 수
     없으므로 kslx.normalize.center_and_scale 의 "클립 중앙값 fallback" 대신
-    "마지막으로 정상 검출됐던 스케일"을 이월해서 쓴다."""
+    "마지막으로 정상 검출됐던 스케일"을 이월해서 쓴다.
+
+    ★ 스트림 시작 직후처럼 유효한 스케일을 한 번도 못 얻었을 때 예전엔
+    MIN_SCALE(1e-3)로 나눠서 학습 때와 똑같은 "좌표 100만 배 폭발" 버그가
+    실시간에서도 그대로 발생했다 (normalize.py 상단 주석 참고) — 그 프레임의
+    에너지가 말도 안 되게 커져서 없는 단어 시작/끝을 잘못 감지하게 만든다.
+    이제는 그 경우 `None` 을 반환해서 호출부가 그 프레임을 건너뛰게 한다."""
 
     def __init__(self):
         self.last_scale: float | None = None
 
-    def normalize(self, frame89: np.ndarray) -> np.ndarray:
+    def normalize(self, frame89: np.ndarray) -> np.ndarray | None:
         neck = frame89[POSE13_NECK_IDX]
         centered = frame89 - neck
         shoulder_vec = frame89[POSE13_R_SHOULDER_IDX] - frame89[POSE13_L_SHOULDER_IDX]
         scale = float(np.linalg.norm(shoulder_vec))
         if scale < DEGENERATE_SCALE_PX:
-            scale = self.last_scale if self.last_scale is not None else MIN_SCALE
+            if self.last_scale is None:
+                return None  # 유효한 스케일을 아직 한 번도 못 얻음 — 이 프레임은 버린다
+            scale = self.last_scale
         else:
             self.last_scale = scale
-        return centered / max(scale, MIN_SCALE)
+        return centered / scale
+
+    @property
+    def calibrated(self) -> bool:
+        return self.last_scale is not None
+
+
+class OneEuroFilter:
+    """저지터 실시간 스무딩 필터 (Casiez et al. 2012). MediaPipe 키포인트는
+    OpenPose보다 프레임간 지터가 커서(연구 문헌에서도 보고된 차이 — 손 전체가
+    통째로 빠지거나 잡히는 식의 이산적 실패 패턴 때문에 튀는 값이 잦다),
+    가만히 있을 땐 많이 누르고 빠르게 움직일 땐 반응성을 유지하는 적응형
+    저역통과 필터를 하나 앞단에 둔다. 좌표(x,y) 전체에 벡터화해서 적용한다.
+    """
+
+    def __init__(self, min_cutoff: float = 1.2, beta: float = 0.3, d_cutoff: float = 1.0):
+        self.min_cutoff = min_cutoff
+        self.beta = beta
+        self.d_cutoff = d_cutoff
+        self.x_prev: np.ndarray | None = None
+        self.dx_prev: np.ndarray | None = None
+
+    @staticmethod
+    def _alpha(dt: float, cutoff) -> np.ndarray:
+        r = 2.0 * np.pi * cutoff * dt
+        return r / (r + 1.0)
+
+    def __call__(self, x: np.ndarray, dt: float) -> np.ndarray:
+        if self.x_prev is None:
+            self.x_prev = x.copy()
+            self.dx_prev = np.zeros_like(x)
+            return x
+        dt = max(dt, 1e-3)
+        dx = (x - self.x_prev) / dt
+        a_d = self._alpha(dt, self.d_cutoff)
+        dx_hat = a_d * dx + (1 - a_d) * self.dx_prev
+        cutoff = self.min_cutoff + self.beta * np.abs(dx_hat)
+        a = self._alpha(dt, cutoff)
+        x_hat = a * x + (1 - a) * self.x_prev
+        self.x_prev = x_hat
+        self.dx_prev = dx_hat
+        return x_hat
 
 
 def hand_energy(prev_norm: np.ndarray, curr_norm: np.ndarray) -> float:

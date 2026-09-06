@@ -33,7 +33,7 @@ from kslx.data.aihub import word_label_map
 from kslx.models.conv_transformer import ConvTransformer
 from kslx.normalize import featurize
 from kslx.sentence import SentenceBuilder
-from kslx.stream import LiveNormalizer, SegmentGate, hand_energy
+from kslx.stream import LiveNormalizer, OneEuroFilter, SegmentGate, hand_energy
 
 WINDOWS_KOREAN_FONT = r"C:\Windows\Fonts\malgun.ttf"
 MODEL_BUNDLE_DEFAULT = Path(__file__).parent / "mp_models" / "holistic_landmarker.task"
@@ -98,6 +98,11 @@ def main():
     ap.add_argument("--end-hold", type=int, default=10, help="이 프레임 수만큼 저에너지가 지속되면 단어 끝으로 판정")
     ap.add_argument("--sentence-end-hold", type=int, default=45,
                      help="이 프레임 수만큼 계속 idle 이면 지금까지 모은 단어로 문장을 완성 (기본 ~1.5초@30fps)")
+    ap.add_argument("--no-smooth", action="store_true",
+                     help="MediaPipe 키포인트 지터 완화용 One-Euro 필터 끄기")
+    ap.add_argument("--min-cutoff", type=float, default=1.2, help="스무딩 필터 민감도(작을수록 더 부드럽지만 반응이 늦음)")
+    ap.add_argument("--beta", type=float, default=0.3, help="스무딩 필터 반응성(클수록 빠른 움직임에 덜 눌림)")
+    ap.add_argument("--no-calibrate", action="store_true", help="시작 시 어깨너비 보정 단계 건너뛰기")
     ap.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args()
 
@@ -116,10 +121,12 @@ def main():
     manual_buffer: list[np.ndarray] = []
     gate = SegmentGate(start_energy=args.start_energy, end_energy=args.end_energy, end_hold=args.end_hold)
     live_norm = LiveNormalizer()
+    smoother = None if args.no_smooth else OneEuroFilter(min_cutoff=args.min_cutoff, beta=args.beta)
     prev_norm_frame = None
     last_result = None
     sentence_builder = SentenceBuilder(sentence_end_hold=args.sentence_end_hold)
     last_sentence = ""
+    t_prev = time.time()
     t0 = time.time()
 
     print("모드: auto(에너지 자동 분할) / manual(SPACE 수동) — M 으로 전환")
@@ -127,6 +134,28 @@ def main():
     print("단어를 이어서 하면 자동으로 모았다가 한동안 멈추면 문장으로 합칩니다.")
     print("ENTER: 지금까지 모은 단어로 문장 즉시 완성 | C: 문장 버퍼만 비움")
     print("R: 취소 | Q/ESC: 종료")
+
+    if not args.no_calibrate:
+        print("어깨가 보이게 카메라 앞에 서 주세요 — 자동으로 보정합니다...")
+        while not live_norm.calibrated:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            h, w = frame.shape[:2]
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            ts_ms = int((time.time() - t0) * 1000)
+            result = landmarker.detect_for_video(mp_image, ts_ms)
+            frame89 = holistic_result_to_frame89(result, w, h, use_face=not args.no_face)
+            live_norm.normalize(frame89)
+            frame = put_korean_text(frame, "보정 중... 어깨가 보이게 서 주세요", (10, 10),
+                                     font_small, color=(0, 200, 255))
+            cv2.imshow("KSL realtime (kslx)", frame)
+            if (cv2.waitKey(1) & 0xFF) in (ord("q"), 27):
+                cap.release()
+                cv2.destroyAllWindows()
+                return
+        print("보정 완료.")
 
     while True:
         ok, frame = cap.read()
@@ -139,9 +168,19 @@ def main():
         result = landmarker.detect_for_video(mp_image, ts_ms)
         frame89 = holistic_result_to_frame89(result, w, h, use_face=not args.no_face)
 
+        t_now = time.time()
+        dt = t_now - t_prev
+        t_prev = t_now
+        if smoother is not None:
+            frame89 = smoother(frame89, dt)
+
         norm_frame = live_norm.normalize(frame89)
-        energy = hand_energy(prev_norm_frame, norm_frame) if prev_norm_frame is not None else 0.0
-        prev_norm_frame = norm_frame
+        if prev_norm_frame is not None and norm_frame is not None:
+            energy = hand_energy(prev_norm_frame, norm_frame)
+        else:
+            energy = 0.0  # 둘 중 하나라도 보정 전/미검출이면 이번 프레임은 에너지에 반영하지 않는다
+        if norm_frame is not None:
+            prev_norm_frame = norm_frame
 
         status = ""
         is_idle_for_sentence = False
