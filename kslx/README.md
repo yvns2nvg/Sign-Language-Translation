@@ -55,7 +55,7 @@ python -m kslx.eval_robust --data data/kslx/word_271.npz --ckpt runs/signer_out_
 — 클론 후 별도 다운로드 없이 바로 실행 가능하다.
 
 ```bash
-pip install torch opencv-python mediapipe pillow numpy
+pip install torch opencv-python mediapipe pillow numpy kiwipiepy
 
 python -m kslx.realtime --ckpt runs/signer_out_aug.pt
 ```
@@ -64,12 +64,25 @@ python -m kslx.realtime --ckpt runs/signer_out_aug.pt
 감지해서(`kslx/stream.py`) 매번 SPACE를 누를 필요 없이 이어서 인식한다.
 `--mode manual` 로 기존 SPACE 방식도 가능하고, 실행 중 `M` 키로 전환된다.
 조작: `SPACE`(manual: 녹화 시작/중지, auto: 현재 구간 강제 종료) | `M` 모드 전환 |
+`ENTER` 지금까지 모은 단어로 문장 즉시 완성 | `C` 문장 버퍼 비움 |
 `R` 취소 | `Q`/`ESC` 종료.
 
 ★ 자동 분할은 정식 학습된 경계 검출기가 아니라 휴리스틱이다 — 카메라가 손을
 순간적으로 놓치면 단어가 중간에 잘못 끊길 수 있다. 화면에 뜨는 `energy` 값을
 보면서 `--start-energy`/`--end-energy`/`--end-hold` 를 조정하거나, 안 될 때는
 `--mode manual` 로 돌아갈 것 (`kslx/stream.py` 상단 주석 참고).
+
+### 단어 → 문장 (`sentence.py`)
+
+수어는 한국어를 그대로 옮긴 게 아니라 조사/어미가 거의 없는 독립 문법을
+쓰는 언어라서(자세한 근거는 `kslx/sentence.py` 상단 주석), 인식된 단어를
+그냥 나열하면 "나 학교 가다"처럼 어색하다. 단어가 하나씩 인식될 때마다
+모았다가 한동안(`--sentence-end-hold`, 기본 ~1.5초) 손이 멈추면
+`kiwipiepy`로 품사를 태깅해 조사/어미를 붙인 문장으로 합친다 —
+"나는 학교에 가요"처럼. 완전 오프라인, 규칙 기반(LLM/API 없음)이라 품질에
+한계가 있다 — 특히 연속된 명사 두 개(예: "학교 친구 만나다")는 복합명사인지
+별개 성분인지 구분을 못 해 어색해질 수 있다. 실제 예시와 한계는
+`RESULTS.md`§9 참고.
 
 다른 체크포인트로 직접 학습한 경우가 아니면 `runs/*.pt` 는 커밋하지 않는다
 (`.gitignore` — `signer_out_aug.pt` 하나만 예외로 포함돼 있다).
@@ -91,6 +104,7 @@ kslx/
 ├── leak_report_npz.py          동일 주장을 별도로 만들어진 npz 캐시로 독립 재확인
 ├── eval_robust.py              강건성 평가 — 모델 선택은 이걸로
 ├── stream.py                    에너지 기반 자동 단어 경계 감지 (휴리스틱, 미검증)
+├── sentence.py                  단어 나열 -> 문장 (kiwipiepy 품사 태깅 + 조사/어미 규칙)
 ├── realtime.py                 웹캠 데모 (Windows, 기본 auto/M으로 manual 전환)
 │                              runs/signer_out_aug.pt + mp_models/*.task 이미 포함
 ├── models/conv_transformer.py  1D DepthwiseConv + Transformer, ~1.1M params

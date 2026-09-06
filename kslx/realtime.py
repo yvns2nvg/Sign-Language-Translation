@@ -32,6 +32,7 @@ from kslx.adapters.mediapipe_adapter import holistic_result_to_frame89
 from kslx.data.aihub import word_label_map
 from kslx.models.conv_transformer import ConvTransformer
 from kslx.normalize import featurize
+from kslx.sentence import SentenceBuilder
 from kslx.stream import LiveNormalizer, SegmentGate, hand_energy
 
 WINDOWS_KOREAN_FONT = r"C:\Windows\Fonts\malgun.ttf"
@@ -95,6 +96,8 @@ def main():
     ap.add_argument("--start-energy", type=float, default=0.06)
     ap.add_argument("--end-energy", type=float, default=0.03)
     ap.add_argument("--end-hold", type=int, default=10, help="이 프레임 수만큼 저에너지가 지속되면 단어 끝으로 판정")
+    ap.add_argument("--sentence-end-hold", type=int, default=45,
+                     help="이 프레임 수만큼 계속 idle 이면 지금까지 모은 단어로 문장을 완성 (기본 ~1.5초@30fps)")
     ap.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args()
 
@@ -115,10 +118,14 @@ def main():
     live_norm = LiveNormalizer()
     prev_norm_frame = None
     last_result = None
+    sentence_builder = SentenceBuilder(sentence_end_hold=args.sentence_end_hold)
+    last_sentence = ""
     t0 = time.time()
 
     print("모드: auto(에너지 자동 분할) / manual(SPACE 수동) — M 으로 전환")
     print("SPACE: manual 모드에서 녹화 시작/중지, auto 모드에서 현재 구간 강제 종료")
+    print("단어를 이어서 하면 자동으로 모았다가 한동안 멈추면 문장으로 합칩니다.")
+    print("ENTER: 지금까지 모은 단어로 문장 즉시 완성 | C: 문장 버퍼만 비움")
     print("R: 취소 | Q/ESC: 종료")
 
     while True:
@@ -137,29 +144,44 @@ def main():
         prev_norm_frame = norm_frame
 
         status = ""
+        is_idle_for_sentence = False
         if mode == "auto":
             label, finished_buf = gate.step(frame89, energy)
             if label == "finished" and finished_buf is not None:
                 if len(finished_buf) >= 4:
                     last_result = predict(model, classes, label_map, finished_buf, args.t_out, args.device)
+                    sentence_builder.on_word(last_result[0][0])
                     print(last_result)
                 else:
                     print("구간이 너무 짧습니다 (4프레임 미만) — 무시함")
+            is_idle_for_sentence = gate.state == "idle"
             state_kr = {"idle": "대기", "started": "녹화중", "recording": "녹화중", "finished": "대기"}[label]
             status = f"[auto] {state_kr}  energy={energy:.3f}  frames={len(gate.buffer)}"
         else:
             if manual_recording:
                 manual_buffer.append(frame89)
+            is_idle_for_sentence = not manual_recording
             status = f"[manual] {'REC ' + str(len(manual_buffer)) + 'f' if manual_recording else '대기 (SPACE)'}"
+
+        if is_idle_for_sentence and sentence_builder.tick_idle():
+            words, last_sentence = sentence_builder.finalize()
+            print(f"[문장 완성] {words} -> {last_sentence}")
 
         color = (0, 0, 255) if (mode == "auto" and gate.state == "recording") or \
                                 (mode == "manual" and manual_recording) else (0, 255, 0)
         frame = put_korean_text(frame, status, (10, 10), font_small, color=color)
+        if sentence_builder.words:
+            frame = put_korean_text(frame, "문장: " + " ".join(sentence_builder.words),
+                                     (10, 34), font_small, color=(255, 200, 0))
         if last_result:
-            y = 50
+            y = 60
             for gloss, p in last_result:
                 frame = put_korean_text(frame, f"{gloss}  {p*100:.1f}%", (10, y), font_big)
                 y += 40
+        if last_sentence:
+            h_frame = frame.shape[0]
+            frame = put_korean_text(frame, "-> " + last_sentence, (10, h_frame - 45),
+                                     font_big, color=(255, 255, 0))
 
         cv2.imshow("KSL realtime (kslx)", frame)
         key = cv2.waitKey(1) & 0xFF
@@ -182,6 +204,7 @@ def main():
                     manual_recording = False
                     if len(manual_buffer) >= 4:
                         last_result = predict(model, classes, label_map, manual_buffer, args.t_out, args.device)
+                        sentence_builder.on_word(last_result[0][0])
                         print(last_result)
                     else:
                         print("녹화가 너무 짧습니다 (4프레임 미만) — 무시함")
@@ -189,6 +212,7 @@ def main():
             else:
                 if gate.state == "recording" and len(gate.buffer) >= 4:
                     last_result = predict(model, classes, label_map, gate.buffer, args.t_out, args.device)
+                    sentence_builder.on_word(last_result[0][0])
                     print(last_result)
                 gate.state = "idle"
                 gate.buffer = []
@@ -200,6 +224,13 @@ def main():
             gate.buffer = []
             gate.low_run = 0
             last_result = None
+        elif key in (13, 10):  # ENTER
+            if sentence_builder.words:
+                words, last_sentence = sentence_builder.finalize()
+                print(f"[문장 완성(수동)] {words} -> {last_sentence}")
+        elif key == ord("c"):
+            sentence_builder.words = []
+            sentence_builder.idle_frames = 0
 
     cap.release()
     cv2.destroyAllWindows()
