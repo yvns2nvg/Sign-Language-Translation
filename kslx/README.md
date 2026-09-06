@@ -22,29 +22,44 @@ train 에 그대로 들어가 있으니 정확도가 부풀려진다.
 ```bash
 pip install torch numpy mediapipe opencv-python pillow
 
-# 1) AI Hub WORD 키포인트 JSON → npz 캐시
+# 1) AI Hub WORD 키포인트 JSON → npy 캐시 (메모리맵 가능한 디렉토리 형식.
+#    .npz 로 끝나는 이름을 주면 예전처럼 압축 npz 도 여전히 가능하다)
 python -m kslx.data.build_dataset --root <004.수어영상 경로> \
-    --out data/kslx/word_271.npz --signers 1-16 --words 1-271 --workers 14
+    --out data/kslx/word_full --signers 1-16 --words 1-3000 --workers 12
 
 # 2) 데이터만으로 누수 증명 (모델 불필요)
-python -m kslx.leak_report --root <004.수어영상 경로> --signers 1-16 --words 1-271
+python -m kslx.leak_report --root <004.수어영상 경로> --signers 1-16 --words 1-3000
 
-# 3) 4개 분할 프로토콜 학습 + 비교
-python -m kslx.train --data data/kslx/word_271.npz \
-    --protocol random take_out angle_out signer_out --epochs 100 --tag base
+# 3) 4개 분할 프로토콜 학습 + 비교. --max-classes 로 클래스 수를 제한할 수 있다
+#    (아래 "규모" 항목 참고 — RAM 이 부족하면 필요하다)
+python -m kslx.train --data data/kslx/word_full --max-classes 1200 \
+    --protocol random take_out angle_out signer_out --epochs 50 --tag c1200_aug --aug
 
-# 4) 강건성 평가 (yaw/회전/손 결측/스케일/노이즈/속도) — 모델 선택은 이걸로
-python -m kslx.eval_robust --data data/kslx/word_271.npz --ckpt runs/signer_out_base.pt
+# 4) 강건성 평가 (yaw/회전/손 결측/스케일/노이즈/속도) — 모델 선택은 이걸로.
+#    학습 때 --max-classes 를 줬으면 여기도 똑같이 줘야 한다.
+python -m kslx.eval_robust --data data/kslx/word_full --max-classes 1200 \
+    --ckpt runs/signer_out_c1200_aug.pt
 ```
 
-전체 결과(4개 프로토콜, 증강 전/후 강건성 비교)는 [`RESULTS.md`](RESULTS.md) 참고.
-**최종 추천 체크포인트는 `runs/signer_out_aug.pt`** (signer_out top-1 97.8%,
-모든 강건성 변형에서 1%p 이내 열화).
+전체 결과(4개 프로토콜, 증강 전/후 강건성 비교, 271→1200단어 확장)는
+[`RESULTS.md`](RESULTS.md) 참고.
+**최종 추천 체크포인트는 `runs/signer_out_c1200_aug.pt`** (1200단어, signer_out
+top-1 99.6%, 손 결측 포함 모든 강건성 변형에서 1.4%p 이내 열화).
 
-★ **이 체크포인트는 [`VOCAB_271.txt`](VOCAB_271.txt)에 있는 271단어만 인식할 수 있다.**
-목록에 없는 단어를 수어로 하면 모델이 이 271개 중 하나를 억지로 골라
-답하므로 반드시 틀린다 — 웹캠 테스트는 꼭 이 목록 안의 단어로 할 것.
-대부분 명사(의료/음식/학교/행정/지명/종교)이고 동사·형용사는 몇 개 안 된다.
+★ **이 체크포인트는 [`VOCAB_1200.txt`](VOCAB_1200.txt)에 있는 1200단어만 인식할 수 있다.**
+목록에 없는 단어를 수어로 하면 모델이 이 1200개 중 하나를 억지로 골라
+답하므로 반드시 틀린다 — 웹캠 테스트는 꼭 이 목록 안의 단어로 할 것. 이전
+271단어 버전(`VOCAB_271.txt`)은 동사·형용사가 7개뿐이었는데 1200단어
+버전은 121개라 훨씬 다양한 문장을 시도할 수 있다.
+
+### 규모(3000단어 전체 vs 부분집합) — 이 PC(RAM 31GB) 기준 실측
+
+3000단어 전체(240,000클립, ~20GB)를 memmap 으로 학습시켜봤는데, 한 epoch
+동안 셔플링 때문에 결국 데이터 전체를 훑게 되어 free memory 가 급락,
+**실제로 시스템에 의해 강제 종료됐다.** `--max-classes` 로 필요한 만큼만
+잘라 쓰는 이유가 이거다 — 1200단어(96,000클립, ~8.7GB)는 이 PC에서
+안전하게 돌아갔고 정확도 손실도 없었다(§10 참고). RAM 이 더 넉넉하면
+`--max-classes` 를 올리거나 아예 빼고 3000단어 전체로 시도해봐도 된다.
 
 ## 웹캠 실시간 검증 (`realtime.py`)
 
@@ -55,14 +70,14 @@ python -m kslx.eval_robust --data data/kslx/word_271.npz --ckpt runs/signer_out_
 서브샘플링한 근사치**라 학습 시 얼굴 좌표와 완전히 일치하진 않는다 (미검증,
 성능이 이상하면 `--no-face` 로 먼저 비교할 것).
 
-체크포인트(`runs/signer_out_aug.pt`)와 MediaPipe 모델 번들
+체크포인트(`runs/signer_out_c1200_aug.pt`)와 MediaPipe 모델 번들
 (`kslx/mp_models/holistic_landmarker.task`)은 **이 저장소에 이미 포함돼 있다**
 — 클론 후 별도 다운로드 없이 바로 실행 가능하다.
 
 ```bash
 pip install torch opencv-python mediapipe pillow numpy kiwipiepy
 
-python -m kslx.realtime --ckpt runs/signer_out_aug.pt
+python -m kslx.realtime --ckpt runs/signer_out_c1200_aug.pt
 ```
 
 기본은 `--mode auto`: 손 움직임 에너지로 "단어 끝 → 다음 단어 시작"을 자동
@@ -97,10 +112,11 @@ python -m kslx.realtime --ckpt runs/signer_out_aug.pt
 "나는 학교에 가요"처럼. 완전 오프라인, 규칙 기반(LLM/API 없음)이라 품질에
 한계가 있다 — 특히 연속된 명사 두 개(예: "학교 친구 만나다")는 복합명사인지
 별개 성분인지 구분을 못 해 어색해질 수 있다. 실제 예시와 한계는
-`RESULTS.md`§9 참고.
+`RESULTS.md`§8 참고.
 
 다른 체크포인트로 직접 학습한 경우가 아니면 `runs/*.pt` 는 커밋하지 않는다
-(`.gitignore` — `signer_out_aug.pt` 하나만 예외로 포함돼 있다).
+(`.gitignore` — `signer_out_c1200_aug.pt`(1200단어, 추천)와 `signer_out_aug.pt`
+(271단어, 이전 버전, 비교용) 둘만 예외로 포함돼 있다).
 
 ## 파일 지도
 
@@ -114,18 +130,23 @@ kslx/
 ├── splits.py                  분할 프로토콜 + 사후 감사(leak 있으면 에러)
 ├── augment.py                  학습 배치 증강 (미러/회전/전단/스케일/노이즈/손 결측)
 │                              ★ 이거 없으면 손 결측 시 정확도가 14%로 붕괴함 (RESULTS.md §5-6)
-├── train.py                   학습 + 프로토콜 비교 (--aug 로 증강 on/off)
+├── train.py                   학습 + 프로토콜 비교 (--aug 증강 on/off, --max-classes 로
+│                              대규모 memmap 데이터셋에서 쓸 클래스 수 제한 — "규모" 항목 참고)
 ├── leak_report.py              데이터만으로 누수 정량화 (원본 JSON 스캔)
 ├── leak_report_npz.py          동일 주장을 별도로 만들어진 npz 캐시로 독립 재확인
 ├── eval_robust.py              강건성 평가 — 모델 선택은 이걸로
 ├── stream.py                    에너지 기반 자동 단어 경계 감지 (휴리스틱, 미검증)
 ├── sentence.py                  단어 나열 -> 문장 (kiwipiepy 품사 태깅 + 조사/어미 규칙)
 ├── realtime.py                 웹캠 데모 (Windows, 기본 auto/M으로 manual 전환)
-│                              runs/signer_out_aug.pt + mp_models/*.task 이미 포함
+│                              runs/signer_out_c1200_aug.pt + mp_models/*.task 이미 포함
 ├── models/conv_transformer.py  1D DepthwiseConv + Transformer, ~1.1M params
 ├── adapters/mediapipe_adapter.py  MediaPipe → 89점 레이아웃 변환 (얼굴은 근사)
 └── data/
     ├── aihub.py                JSON 스캐너 + 로더 + 형태소(수어구간) 파서
-    ├── build_dataset.py        npz 캐시 빌더 (멀티프로세스)
+    ├── build_dataset.py        npz/npy 캐시 빌더 (멀티프로세스). --out 이 .npz 면 압축
+    │                          npz, 아니면 메모리맵 가능한 npy 디렉토리(대규모용)
     └── word_labels.json        WORD#### → 한글 (3000단어)
 ```
+
+`VOCAB_1200.txt`/`VOCAB_271.txt` — 각 체크포인트가 실제로 인식 가능한 단어
+전체 목록 (루트에 위치, 위 트리에는 안 그렸다).

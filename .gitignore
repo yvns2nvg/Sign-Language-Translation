@@ -51,6 +51,7 @@ kslx/mp_models/*.task
 !kslx/mp_models/holistic_landmarker.task
 runs/*
 !runs/signer_out_aug.pt
+!runs/signer_out_c1200_aug.pt
 train_log.txt
 train_log_aug.txt
 build_log.txt

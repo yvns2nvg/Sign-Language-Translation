@@ -15,7 +15,6 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch import nn
-from torch.utils.data import DataLoader, TensorDataset
 
 from kslx.augment import augment_features
 from kslx.models.conv_transformer import ConvTransformer, count_params
@@ -24,10 +23,35 @@ from kslx.splits import PROTOCOLS, SplitError
 ClipMeta = namedtuple("ClipMeta", ["word", "signer", "angle", "take_id"])
 
 
-def load_clips_meta(npz) -> list[ClipMeta]:
+def load_dataset(path: Path) -> dict:
+    """--data 가 .npz 면 그대로, 디렉토리면 kslx.data.build_dataset 이 만든
+    npy-dir(메모리맵 가능)로 연다. X 는 npy-dir 일 때만 진짜 np.memmap 이라
+    학습 배치를 뽑을 때만 그만큼만 RAM 에 올라간다 — 3000단어 전체처럼
+    npz 로는 램이 부족한 대규모 데이터셋에 필요하다."""
+    if path.suffix.lower() == ".npz":
+        npz = np.load(path, allow_pickle=False)
+        return {
+            "X": npz["X"], "y": npz["y"], "signer": npz["signer"], "angle": npz["angle"],
+            "take_id": npz["take_id"], "classes": npz["classes"],
+            "feature_dim": int(npz["feature_dim"]), "t_out": int(npz["t_out"]),
+        }
+    meta = json.loads((path / "meta.json").read_text(encoding="utf-8"))
+    n_valid = meta["n_valid"]
+    t_out, feature_dim = meta["t_out"], meta["feature_dim"]
+    x_mm = np.memmap(path / "X.raw", dtype=np.float32, mode="r",
+                      shape=(n_valid, t_out, feature_dim))
+    return {
+        "X": x_mm, "y": np.load(path / "y.npy"), "signer": np.load(path / "signer.npy"),
+        "angle": np.load(path / "angle.npy"), "take_id": np.load(path / "take_id.npy"),
+        "classes": np.load(path / "classes.npy"),
+        "feature_dim": meta["feature_dim"], "t_out": meta["t_out"],
+    }
+
+
+def load_clips_meta(data: dict) -> list[ClipMeta]:
     return [
         ClipMeta(word=int(w), signer=int(s), angle=str(a), take_id=str(t))
-        for w, s, a, t in zip(npz["y"], npz["signer"], npz["angle"], npz["take_id"])
+        for w, s, a, t in zip(data["y"], data["signer"], data["angle"], data["take_id"])
     ]
 
 
@@ -43,33 +67,73 @@ def topk_accuracy(logits: torch.Tensor, target: torch.Tensor, ks=(1, 5)) -> dict
 
 def run_protocol(protocol: str, X, y, clips: list[ClipMeta], num_classes: int,
                   device: str, epochs: int, batch_size: int, lr: float,
-                  seed: int, protocol_kwargs: dict, augment: bool = False) -> dict:
+                  seed: int, protocol_kwargs: dict, augment: bool = False,
+                  row_idx: np.ndarray | None = None) -> dict:
+    """row_idx: clips/y 가 X(전체 memmap)의 부분집합만 다룰 때, clips 안에서의
+    위치(local) -> X 안에서의 실제 행 번호(global) 매핑. None 이면 clips 가
+    이미 X 전체에 대응한다(부분집합 아님)."""
+    # local = clips/y(부분집합일 수 있음) 안에서의 위치. global = X(항상 전체
+    # memmap) 안에서의 실제 행 번호. row_idx 가 없으면 둘은 같다.
     split_fn = PROTOCOLS[protocol]
-    train_idx, val_idx = split_fn(clips, **protocol_kwargs)
+    train_idx_local, val_idx_local = split_fn(clips, **protocol_kwargs)
+    train_idx_local = np.asarray(train_idx_local)
+    val_idx_local = np.asarray(val_idx_local)
 
-    x_train = torch.from_numpy(X[train_idx])
-    y_train = torch.from_numpy(y[train_idx]).long()
-    x_val = torch.from_numpy(X[val_idx])
-    y_val = torch.from_numpy(y[val_idx]).long()
+    train_idx = row_idx[train_idx_local] if row_idx is not None else train_idx_local
+    val_idx = row_idx[val_idx_local] if row_idx is not None else val_idx_local
 
-    train_loader = DataLoader(TensorDataset(x_train, y_train), batch_size=batch_size, shuffle=True)
+    # val 은 global 기준으로 정렬해서 들고 있는다(local 도 같은 순서로 맞춤) —
+    # X 가 memmap 일 때 뒤섞인 순서로 몇만 개를 한 번에 읽으면(=파일 전체를
+    # 무작위로 훑는 것과 같음) 호스트 메모리가 급격히 불어나는 걸 실측했다
+    # (3000단어 전체 데이터셋에서 재현돼 학습이 강제종료됨). 정렬하면 순차에
+    # 가까운 접근이 된다.
+    val_order = np.argsort(val_idx)
+    val_idx = val_idx[val_order]
+    val_idx_local = val_idx_local[val_order]
+
+    # X 를 통째로 학습셋/검증셋 크기만큼 미리 뽑아 올리지 않는다 — X 가
+    # memmap(대규모 데이터셋)이면 그 순간 전부 RAM 에 올라가 버린다. 학습은
+    # 배치, 검증은 청크 단위로만 그때그때 memmap 에서 읽는다. y 는 (부분집합일
+    # 수 있는) local 인덱스로 조회한다.
+    y_train_all = y[train_idx_local]
+    y_val_all = y[val_idx_local]
+    eval_chunk = max(batch_size, 2048)
 
     model = ConvTransformer(feature_dim=X.shape[-1], num_classes=num_classes).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
 
+    def evaluate() -> dict:
+        model.eval()
+        all_logits = []
+        with torch.no_grad():
+            for start in range(0, len(val_idx), eval_chunk):
+                chunk_idx = val_idx[start:start + eval_chunk]
+                xb = torch.from_numpy(np.asarray(X[chunk_idx])).to(device)
+                all_logits.append(model(xb).cpu())
+        logits = torch.cat(all_logits, dim=0)
+        target = torch.from_numpy(y_val_all).long()
+        return topk_accuracy(logits, target, ks=(1, 5))
+
     best_top1 = 0.0
     best_state = None
-    x_val_dev = x_val.to(device)
-    y_val_dev = y_val.to(device)
     aug_rng = np.random.default_rng(seed)
+    shuffle_rng = np.random.default_rng(seed)
+    n_train = len(train_idx)
 
     for epoch in range(epochs):
         model.train()
         epoch_loss = 0.0
         n_batches = 0
-        for xb, yb in train_loader:
+        perm = shuffle_rng.permutation(n_train)
+        for start in range(0, n_train, batch_size):
+            batch_pos = perm[start:start + batch_size]
+            batch_idx = train_idx[batch_pos]
+            # 인덱스 정렬 — memmap 랜덤 접근보다 순차/근접 접근이 훨씬 빠르다
+            order = np.argsort(batch_idx)
+            xb = torch.from_numpy(np.asarray(X[batch_idx[order]]))
+            yb = torch.from_numpy(y_train_all[batch_pos[order]]).long()
             if augment:
                 xb = augment_features(xb, aug_rng)
             xb, yb = xb.to(device), yb.to(device)
@@ -87,10 +151,7 @@ def run_protocol(protocol: str, X, y, clips: list[ClipMeta], num_classes: int,
             n_batches += 1
         sched.step()
 
-        model.eval()
-        with torch.no_grad():
-            val_logits = model(x_val_dev)
-            metrics = topk_accuracy(val_logits, y_val_dev, ks=(1, 5))
+        metrics = evaluate()
         if metrics["top1"] > best_top1:
             best_top1 = metrics["top1"]
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
@@ -118,17 +179,36 @@ def main():
     ap.add_argument("--n-val-signers", type=int, default=3)
     ap.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--aug", action="store_true", help="학습 배치에 실시간 증강 적용 (kslx.augment)")
+    ap.add_argument("--max-classes", type=int, default=None,
+                     help="앞에서부터 이 개수의 클래스만 사용 (memmap 대규모 데이터셋에서 "
+                          "한 epoch 동안 실제로 건드리는 바이트 수를 줄여 메모리 압박을 낮춘다 — "
+                          "3000단어 전체를 한 번에 학습시키면 이 PC(31GB RAM)에서 매 epoch마다 "
+                          "거의 전체 20GB+ 를 훑어 free memory가 급락, 실제로 강제종료된 적이 있다)")
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    npz = np.load(args.data, allow_pickle=False)
-    X, y = npz["X"], npz["y"]
-    classes = npz["classes"]
+    data = load_dataset(args.data)
+    X, y_full = data["X"], data["y"]
+    classes = data["classes"]
+
+    row_idx = None
+    if args.max_classes is not None and args.max_classes < len(classes):
+        # classes 는 항상 오름차순 word id 라, 앞 K개만 쓰는 건 y < K 와 동치이고
+        # 그 값들은 이미 0..K-1 이라 클래스 재매핑이 필요 없다.
+        row_idx = np.where(y_full < args.max_classes)[0]
+        classes = classes[:args.max_classes]
+        print(f"[train] --max-classes {args.max_classes}: {len(row_idx)}/{len(y_full)} 행만 사용")
+
+    y = y_full[row_idx] if row_idx is not None else y_full
+    signer = data["signer"][row_idx] if row_idx is not None else data["signer"]
+    angle = data["angle"][row_idx] if row_idx is not None else data["angle"]
+    take_id = data["take_id"][row_idx] if row_idx is not None else data["take_id"]
     num_classes = len(classes)
-    clips = load_clips_meta(npz)
-    print(f"[train] X={X.shape} y_classes={num_classes} device={args.device}")
+    clips = load_clips_meta({"y": y, "signer": signer, "angle": angle, "take_id": take_id})
+    print(f"[train] X={X.shape} ({'memmap' if isinstance(X, np.memmap) else 'in-RAM'}) "
+          f"y_classes={num_classes} device={args.device}")
 
     dummy = ConvTransformer(feature_dim=X.shape[-1], num_classes=num_classes)
     print(f"[train] model params: {count_params(dummy):,}")
@@ -148,7 +228,7 @@ def main():
         try:
             res = run_protocol(protocol, X, y, clips, num_classes, args.device,
                                 args.epochs, args.batch_size, args.lr, args.seed, kwargs,
-                                augment=args.aug)
+                                augment=args.aug, row_idx=row_idx)
         except SplitError as e:
             print(f"  [SKIP] {protocol}: {e}")
             results.append({"protocol": protocol, "error": str(e)})
@@ -168,6 +248,11 @@ def main():
         res["checkpoint"] = str(ckpt_path)
         res["elapsed_sec"] = elapsed
         results.append(res)
+
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     summary_path = Path("runs") / f"{args.tag}_results.json"
     with open(summary_path, "w", encoding="utf-8") as f:

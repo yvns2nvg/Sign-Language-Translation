@@ -22,7 +22,7 @@ import torch
 
 from kslx.models.conv_transformer import ConvTransformer
 from kslx.normalize import FEATURE_DIM
-from kslx.train import ClipMeta, load_clips_meta, topk_accuracy
+from kslx.train import ClipMeta, load_clips_meta, load_dataset, topk_accuracy
 from kslx.splits import PROTOCOLS
 
 
@@ -105,23 +105,56 @@ VARIANTS = {
 }
 
 
+def _forward_chunked(model, x: torch.Tensor, device: str, chunk: int = 2048) -> torch.Tensor:
+    """val 이 크면(예: 3000단어 전체의 angle_out) 한 번에 GPU 에 올리다 CUDA OOM 이
+    난다 — 실측(96,000개 val, 15.9GB GPU 에서 22GB+ 요구) 이후 청크로 나눈다."""
+    outs = []
+    with torch.no_grad():
+        for start in range(0, x.shape[0], chunk):
+            outs.append(model(x[start:start + chunk].to(device)).cpu())
+    return torch.cat(outs, dim=0)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", type=Path, required=True)
     ap.add_argument("--ckpt", type=Path, nargs="+", required=True)
     ap.add_argument("--protocol", type=str, default="angle_out")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--max-classes", type=int, default=None,
+                     help="체크포인트가 --max-classes 로 학습됐으면 여기도 같은 값을 줘야 한다 "
+                          "(안 그러면 클래스 범위가 안 맞아 정확도가 의미 없어지거나 메모리 문제가 커진다)")
     ap.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args()
 
-    npz = np.load(args.data, allow_pickle=False)
-    X, y = npz["X"], npz["y"]
-    clips = load_clips_meta(npz)
-    _, val_idx = PROTOCOLS[args.protocol](clips, val_angles=("L", "U")) \
+    data = load_dataset(args.data)
+    X, y_full = data["X"], data["y"]
+
+    row_idx = None
+    if args.max_classes is not None and args.max_classes < len(data["classes"]):
+        row_idx = np.where(y_full < args.max_classes)[0]
+        print(f"[eval_robust] --max-classes {args.max_classes}: {len(row_idx)}/{len(y_full)} 행만 사용")
+    y = y_full[row_idx] if row_idx is not None else y_full
+    signer = data["signer"][row_idx] if row_idx is not None else data["signer"]
+    angle = data["angle"][row_idx] if row_idx is not None else data["angle"]
+    take_id = data["take_id"][row_idx] if row_idx is not None else data["take_id"]
+    clips = load_clips_meta({"y": y, "signer": signer, "angle": angle, "take_id": take_id})
+
+    _, val_idx_local = PROTOCOLS[args.protocol](clips, val_angles=("L", "U")) \
         if args.protocol == "angle_out" else PROTOCOLS[args.protocol](clips)
-    x_val, y_val = X[val_idx], y[val_idx]
+    val_idx_local = np.asarray(val_idx_local)
+    # global = X(항상 전체 memmap) 안에서의 실제 행 번호. local = clips/y(부분집합일
+    # 수 있음) 안에서의 위치. 정렬은 global 기준으로 해야 memmap 접근에 지역성이
+    # 생기고, local 도 같은 순서로 맞춰야 y 가 어긋나지 않는다.
+    val_idx_global = row_idx[val_idx_local] if row_idx is not None else val_idx_local
+    order = np.argsort(val_idx_global)
+    val_idx_global = val_idx_global[order]
+    val_idx_local = val_idx_local[order]
+    y_val = y[val_idx_local]
+
+    x_val = np.asarray(X[val_idx_global])  # 정렬된 순서로 한 번에 읽음 (memmap 순차 접근)
     pos_val = _unpack(x_val)
-    print(f"[eval_robust] protocol={args.protocol} n_val={len(val_idx)}")
+    print(f"[eval_robust] protocol={args.protocol} n_val={len(val_idx_global)}")
 
     rng = np.random.default_rng(args.seed)
     header = f"{'variant':<16}" + "".join(f"{Path(c).stem:>18}" for c in args.ckpt)
@@ -138,9 +171,8 @@ def main():
             model = ConvTransformer(feature_dim=ckpt["feature_dim"], num_classes=ckpt["num_classes"])
             model.load_state_dict(ckpt["state_dict"])
             model.to(args.device).eval()
-            with torch.no_grad():
-                logits = model(x_t.to(args.device))
-                top1 = topk_accuracy(logits, y_t.to(args.device), ks=(1,))["top1"]
+            logits = _forward_chunked(model, x_t, args.device)
+            top1 = topk_accuracy(logits, y_t, ks=(1,))["top1"]
             if name == "clean":
                 baseline[str(ckpt_path)] = top1
             delta = top1 - baseline.get(str(ckpt_path), top1)
