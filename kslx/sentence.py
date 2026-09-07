@@ -103,16 +103,24 @@ def _classify(gloss: str) -> WordInfo:
 
 
 def _predicate_stem_toks(info: WordInfo) -> list:
-    """어미(EF)를 뺀 나머지 형태소 — 새 어미를 붙이기 위한 어간."""
+    """어미를 뺀 나머지 형태소 — 새 어미를 붙이기 위한 어간.
+
+    어미 태그는 EF(종결)만 있는 게 아니라 EC(연결, 예: "나쁘다"->나쁘/VA+다/EC)
+    도 있다 — kiwi 가 문맥 없는 단어 하나를 분석할 때 종결어미 대신 연결어미로
+    보는 경우가 있다. EF만 걸러내면 이 "다"가 어간에 남아 "나쁘다어요" 처럼
+    깨지므로, E로 시작하는 어미 태그는 전부 제외한다.
+    """
     if info.forced:
         return [(info.gloss[:-1], "VV")]
-    return [(t.form, t.tag) for t in info.toks if t.tag != "EF"]
+    return [(t.form, t.tag) for t in info.toks if not t.tag.startswith("E")]
 
 
 def _is_adjective(info: WordInfo) -> bool:
     if info.forced:
         return False  # 강제 처리 케이스는 형용사인지 알 방법이 없어 동사로 취급
-    return any(t.tag.startswith("VA") for t in info.toks)
+    # VA(형용사 어간) 뿐 아니라 XSA(명사+"하다"로 형용사를 만드는 접미사,
+    # 예: "피곤하다"->피곤/NNG+하/XSA)도 형용사로 봐야 한다.
+    return any(t.tag.startswith(("VA", "XSA")) for t in info.toks)
 
 
 def compose_sentence(glosses: list[str]) -> str:
